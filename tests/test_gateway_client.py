@@ -97,6 +97,16 @@ class TestAgentRun:
         assert [chunk async for chunk in run.iter_stream(timeout=1.0)] == ["Home Assistant"]
 
     @pytest.mark.asyncio
+    async def test_empty_summary_preserves_buffered_reply(self) -> None:
+        run = AgentRun("run-1", stream=True)
+        run.add_delta("Home Assistant")
+        run.set_complete("ok", "")
+        assert run.get_response() == "Home Assistant"
+        assert [chunk async for chunk in run.iter_stream(timeout=1.0)] == [
+            "Home Assistant"
+        ]
+
+    @pytest.mark.asyncio
     async def test_no_final_summary_keeps_streamed_answer(self) -> None:
         run = AgentRun("run-1", stream=True)
         run.add_delta("Home")
