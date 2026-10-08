@@ -395,6 +395,18 @@ For a compatible voice pipeline, enable **Streaming responses** under
 `ChatLog.async_add_delta_content_stream`. If Assist only displays an initial
 word, switch streaming off rather than increasing the TTS character limit.
 
+### Final-answer consistency during streaming
+
+OpenClaw may emit assistant deltas followed by an authoritative final `summary`
+or `result.payloads`. The streaming path now appends any missing final suffix.
+If the final text contradicts provisional output, a new ChatLog assistant
+message carries the corrected answer so the `intent-end` response is complete.
+Previously emitted TTS audio cannot be retracted if the agent revises its answer.
+
+Leave **TTS max characters** at `0` and turn on **Streaming responses**
+to test the streaming path. Streaming remains opt-in until validated on an
+actual Home Assistant installation.
+
 ### TTS response trimming
 
 **TTS max characters** caps spoken replies:
