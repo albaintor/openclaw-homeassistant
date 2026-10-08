@@ -1,0 +1,123 @@
+diff --git a/custom_components/openclaw/config_flow.py b/custom_components/openclaw/config_flow.py
+--- a/custom_components/openclaw/config_flow.py
++++ b/custom_components/openclaw/config_flow.py
+@@ -26,6 +26,7 @@
+     CONF_STRIP_EMOJIS,
+     CONF_THINKING,
+     CONF_TTS_MAX_CHARS,
++    CONF_STREAMING_ENABLED,
+     CONF_USE_SSL,
+     DEFAULT_AGENT_ID,
+     DEFAULT_BACKGROUND_ENABLED,
+@@ -40,6 +41,7 @@
+     DEFAULT_STRIP_EMOJIS,
+     DEFAULT_THINKING,
+     DEFAULT_TTS_MAX_CHARS,
++    DEFAULT_STREAMING_ENABLED,
+     DEFAULT_TIMEOUT,
+     DEFAULT_USE_SSL,
+     DOMAIN,
+@@ -512,6 +514,9 @@ async def async_step_init(
+                     CONF_TTS_MAX_CHARS: user_input.get(
+                         CONF_TTS_MAX_CHARS, DEFAULT_TTS_MAX_CHARS
+                     ),
++                    CONF_STREAMING_ENABLED: user_input.get(
++                        CONF_STREAMING_ENABLED, DEFAULT_STREAMING_ENABLED
++                    ),
+                 }
+                 self.hass.config_entries.async_update_entry(
+                     self.config_entry,
+@@ -566,6 +571,12 @@ async def async_step_init(
+                         CONF_TTS_MAX_CHARS, DEFAULT_TTS_MAX_CHARS
+                     ),
+                 ): vol.All(int, vol.Range(min=0, max=2000)),
++                vol.Optional(
++                    CONF_STREAMING_ENABLED,
++                    default=current.get(
++                        CONF_STREAMING_ENABLED, DEFAULT_STREAMING_ENABLED
++                    ),
++                ): bool,
+                 **_background_schema_fields(current),
+                 **_proactive_schema_fields(current),
+             }
+diff --git a/custom_components/openclaw/const.py b/custom_components/openclaw/const.py
+--- a/custom_components/openclaw/const.py
++++ b/custom_components/openclaw/const.py
+@@ -11,7 +11,8 @@
+ DEFAULT_MODEL = None
+ DEFAULT_THINKING = None
+ DEFAULT_STRIP_EMOJIS = True  # Strip emojis from TTS by default
+-DEFAULT_TTS_MAX_CHARS = 0  # 0 disables TTS trimming
++DEFAULT_TTS_MAX_CHARS = 0  # 0 disables TTS trimming
++DEFAULT_STREAMING_ENABLED = False  # Only enable ChatLog streaming when explicitly opted in
+ DEFAULT_AGENT_ID = None  # Use gateway default agent
+ 
+ # Proactive voice: speak agent-initiated turns (cron/background/follow-ups) on a
+@@ -50,7 +51,8 @@
+ CONF_MODEL = "model"
+ CONF_THINKING = "thinking"
+ CONF_STRIP_EMOJIS = "strip_emojis"
+-CONF_TTS_MAX_CHARS = "tts_max_chars"
++CONF_TTS_MAX_CHARS = "tts_max_chars"
++CONF_STREAMING_ENABLED = "streaming_enabled"
+ CONF_PROACTIVE_ENABLED = "proactive_enabled"
+ CONF_PROACTIVE_SATELLITE = "proactive_satellite"
+ CONF_PROACTIVE_MODE = "proactive_mode"
+diff --git a/custom_components/openclaw/conversation.py b/custom_components/openclaw/conversation.py
+--- a/custom_components/openclaw/conversation.py
++++ b/custom_components/openclaw/conversation.py
+@@ -26,13 +26,15 @@
+     CONF_PROACTIVE_SATELLITE,
+     CONF_STRIP_EMOJIS,
+     CONF_TTS_MAX_CHARS,
++    CONF_STREAMING_ENABLED,
+     DEFAULT_BACKGROUND_ENABLED,
+     DEFAULT_BACKGROUND_GRACE,
+     DEFAULT_HOLDING_PHRASE,
+     DEFAULT_PROACTIVE_ENABLED,
+     DEFAULT_PROACTIVE_MODE,
+     DEFAULT_STRIP_EMOJIS,
+     DEFAULT_TTS_MAX_CHARS,
++    DEFAULT_STREAMING_ENABLED,
+     DOMAIN,
+     PROACTIVE_MODE_START_CONVERSATION,
+ )
+@@ -123,7 +125,12 @@ def __init__(
+         self._config_entry = config_entry
+         self._gateway_client = gateway_client
+         self._attr_unique_id = config_entry.entry_id
+-        self._attr_supports_streaming = self._supports_streaming_result()
++        options = {**config_entry.data, **config_entry.options}
++        self._attr_supports_streaming = (
++            options.get(CONF_STREAMING_ENABLED, DEFAULT_STREAMING_ENABLED)
++            and options.get(CONF_TTS_MAX_CHARS, DEFAULT_TTS_MAX_CHARS) == 0
++            and self._supports_streaming_result()
++        )
+         # Runs detached past the grace period, reporting back via announce.
+         self._background_tasks: set[asyncio.Task] = set()
+ 
+@@ -239,6 +246,9 @@ def extra_state_attributes(self) -> dict[str, Any]:
+             "thinking": self._gateway_client.thinking,
+             "strip_emojis": data.get(CONF_STRIP_EMOJIS, DEFAULT_STRIP_EMOJIS),
+             "tts_max_chars": data.get(CONF_TTS_MAX_CHARS, DEFAULT_TTS_MAX_CHARS),
++            "streaming_enabled": data.get(
++                CONF_STREAMING_ENABLED, DEFAULT_STREAMING_ENABLED
++            ),
+             "proactive_enabled": data.get(
+                 CONF_PROACTIVE_ENABLED, DEFAULT_PROACTIVE_ENABLED
+             ),
+@@ -506,9 +516,13 @@ async def _build_streaming_result(
+         Returns None when streaming is unavailable (or TTS trimming is on,
+         which needs the full text), so callers fall back to a plain result.
+         """
++        config = {**self._config_entry.data, **self._config_entry.options}
++        # Assist text sessions must be able to wait for the final answer; the
++        # optional ChatLog streaming path is not reliable on every HA client.
++        if not config.get(CONF_STREAMING_ENABLED, DEFAULT_STREAMING_ENABLED):
++            return None
+         if not self._supports_streaming_result():
+             return None
+-        config = {**self._config_entry.data, **self._config_entry.options}
+         if config.get(CONF_TTS_MAX_CHARS, DEFAULT_TTS_MAX_CHARS) > 0:
+             return None
+ 
