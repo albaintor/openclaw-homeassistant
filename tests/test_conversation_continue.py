@@ -146,6 +146,31 @@ async def test_chatlog_streaming_opt_in_without_tts_limit() -> None:
     assert result.response.speech == "Chunk one and two"
 
 
+async def test_streaming_terminal_replacement_updates_intent_end() -> None:
+    """A non-prefix final answer becomes the ChatLog's last assistant item."""
+    conv = load_conversation_module(streaming="chatlog")
+    from custom_components.openclaw.gateway_client import AgentTextReplacement
+
+    gateway = _make_gateway()
+
+    async def fake_stream(_message: str, **_kw):
+        yield "Home"
+        yield AgentTextReplacement("La domotique contrôle la maison.")
+
+    gateway.stream_agent_request = fake_stream
+    entity = conv.OpenClawConversationEntity(_make_entry(), gateway)
+    chat_log = conv.conversation.ChatLog()
+
+    result = await entity._async_handle_message(_make_user_input(), chat_log)
+
+    assert chat_log.deltas == [
+        {"role": "assistant"},
+        {"content": "Home"},
+        {"role": "assistant", "content": "La domotique contrôle la maison."},
+    ]
+    assert result.response.speech == "La domotique contrôle la maison."
+
+
 # ---------- streaming via ChatLog deltas ----------
 
 
