@@ -1,5 +1,5 @@
 diff --git a/README.md b/README.md
-index a9ab32d..da08fd7 100644
+index a9ab32d..6eb38cb 100644
 --- a/README.md
 +++ b/README.md
 @@ -72,6 +72,7 @@ through your smart-home voice assistant.
@@ -18,7 +18,7 @@ index a9ab32d..da08fd7 100644
  | **Background work** | On | Slow requests answer later via announce instead of timing out |
  | **Grace period** | `10` s | Silence before a request is deferred to background (3–60) |
  | **Holding phrase** | “On it — I’ll let you know when it’s done.” | Spoken when a request is deferred |
-@@ -380,6 +382,19 @@ for cleaner TTS:
+@@ -380,6 +382,31 @@ for cleaner TTS:
  - Disable it if your TTS engine handles emojis well, or if you mostly use the text
    Assist box.
  
@@ -34,6 +34,18 @@ index a9ab32d..da08fd7 100644
 +**Configure** and set **TTS max characters** to `0`. This enables streaming via
 +`ChatLog.async_add_delta_content_stream`. If Assist only displays an initial
 +word, switch streaming off rather than increasing the TTS character limit.
++
++### Final-answer consistency during streaming
++
++OpenClaw may emit assistant deltas followed by an authoritative final `summary`
++or `result.payloads`. The streaming path now appends any missing final suffix.
++If the final text contradicts provisional output, a new ChatLog assistant
++message carries the corrected answer so the `intent-end` response is complete.
++Previously emitted TTS audio cannot be retracted if the agent revises its answer.
++
++Leave **TTS max characters** at `0` and turn on **Streaming responses**
++to test the streaming path. Streaming remains opt-in until validated on an
++actual Home Assistant installation.
 +
  ### TTS response trimming
  
@@ -106,7 +118,7 @@ index e20ce77..7844fd4 100644
  CONF_PROACTIVE_SATELLITE = "proactive_satellite"
  CONF_PROACTIVE_MODE = "proactive_mode"
 diff --git a/custom_components/openclaw/conversation.py b/custom_components/openclaw/conversation.py
-index 36122ad..b21d18e 100644
+index 36122ad..fa8a03b 100644
 --- a/custom_components/openclaw/conversation.py
 +++ b/custom_components/openclaw/conversation.py
 @@ -26,6 +26,7 @@
@@ -125,6 +137,15 @@ index 36122ad..b21d18e 100644
      DOMAIN,
      PROACTIVE_MODE_START_CONVERSATION,
  )
+@@ -42,7 +44,7 @@
+     GatewayConnectionError,
+     GatewayTimeoutError,
+ )
+-from .gateway_client import AgentRun, OpenClawGatewayClient
++from .gateway_client import AgentRun, AgentTextReplacement, OpenClawGatewayClient
+ 
+ _LOGGER = logging.getLogger(__name__)
+ 
 @@ -123,7 +125,12 @@ def __init__(
          self._config_entry = config_entry
          self._gateway_client = gateway_client
@@ -199,7 +220,28 @@ index 36122ad..b21d18e 100644
              user_input,
              chat_log,
              user_message,
-@@ -499,151 +504,96 @@ def _resolve_report_satellite(self, device_id: str | None) -> str | None:
+@@ -390,15 +395,14 @@ async def _handle_with_grace(
+             return streaming_result
+ 
+         # No streaming support: drain to completion and answer plainly.
+-        chunks = [first_chunk] if first_chunk else []
+-        async for chunk in self._gateway_client.stream_run(agent_run):
+-            chunks.append(chunk)
+-        response_text = agent_run.get_response() or "".join(chunks)
++        async for _chunk in self._gateway_client.stream_run(agent_run):
++            pass
++        response_text = agent_run.get_response()
+         return self._build_plain_result(user_input, chat_log, response_text)
+ 
+     async def _resume_stream(
+-        self, agent_run: AgentRun, first_chunk: str | None
+-    ) -> AsyncIterator[str]:
++        self, agent_run: AgentRun, first_chunk: str | AgentTextReplacement | None
++    ) -> AsyncIterator[str | AgentTextReplacement]:
+         """Re-yield the peeked first chunk, then the rest of the run."""
+         if first_chunk:
+             yield first_chunk
+@@ -499,151 +503,106 @@ def _resolve_report_satellite(self, device_id: str | None) -> str | None:
          config = {**self._config_entry.data, **self._config_entry.options}
          return config.get(CONF_PROACTIVE_SATELLITE)
  
@@ -209,13 +251,13 @@ index 36122ad..b21d18e 100644
          user_input: conversation.ConversationInput,
          chat_log: conversation.ChatLog,
          user_message: str,
-         chunk_source: AsyncIterator[str] | None = None,
+-        chunk_source: AsyncIterator[str] | None = None,
++        chunk_source: AsyncIterator[str | AgentTextReplacement] | None = None,
      ) -> conversation.ConversationResult | None:
 -        """Build a streaming conversation result when supported."""
 -        if not self._supports_streaming_result():
 -            return None
-+        """Stream the reply into the chat log so HA can start TTS early.
- 
+-
 -        intent_response = intent.IntentResponse(language=user_input.language)
 -        result = conversation.ConversationResult(
 -            response=intent_response,
@@ -239,7 +281,8 @@ index 36122ad..b21d18e 100644
 -            return result
 -        except AttributeError:
 -            pass
--
++        """Stream the reply into the chat log so HA can start TTS early.
+ 
 -        streaming_cls = getattr(conversation, "StreamingConversationResult", None)
 -        if streaming_cls is None:
 +        Returns None when streaming is unavailable (or TTS trimming is on,
@@ -322,13 +365,23 @@ index 36122ad..b21d18e 100644
 +        return result
 +
 +    async def _stream_deltas(
-+        self, chunk_source: AsyncIterator[str], should_strip: bool
++        self, chunk_source: AsyncIterator[str | AgentTextReplacement], should_strip: bool
 +    ) -> AsyncIterator[dict[str, str]]:
 +        """Translate Gateway chunks into ChatLog assistant deltas."""
 +        yield {"role": "assistant"}
          had_content = False
          try:
              async for chunk in chunk_source:
++                if isinstance(chunk, AgentTextReplacement):
++                    corrected = (
++                        EMOJI_PATTERN.sub("", chunk.text)
++                        if should_strip else chunk.text
++                    )
++                    had_content = had_content or bool(corrected)
++                    # The ChatLog delta API cannot retract text. Starting a
++                    # new assistant item lets intent-end return the final text.
++                    yield {"role": "assistant", "content": corrected}
++                    continue
 +                if chunk and should_strip:
 +                    # No .strip(): whitespace between chunks must survive.
 +                    chunk = EMOJI_PATTERN.sub("", chunk)
@@ -408,10 +461,32 @@ index 36122ad..b21d18e 100644
      def _finalize_response(
          self,
 diff --git a/custom_components/openclaw/gateway_client.py b/custom_components/openclaw/gateway_client.py
-index 3a7e356..27ca31a 100644
+index 3a7e356..46965a4 100644
 --- a/custom_components/openclaw/gateway_client.py
 +++ b/custom_components/openclaw/gateway_client.py
-@@ -28,9 +28,9 @@ def __init__(self, run_id: str, stream: bool = False) -> None:
+@@ -1,6 +1,7 @@
+ """High-level OpenClaw Gateway API client."""
+ 
+ import asyncio
++from dataclasses import dataclass
+ import logging
+ import time
+ import uuid
+@@ -19,6 +20,13 @@
+ _LOGGER = logging.getLogger(__name__)
+ 
+ 
++@dataclass(frozen=True)
++class AgentTextReplacement:
++    """The authoritative text replaces previously streamed content."""
++
++    text: str
++
++
+ class AgentRun:
+     """Tracks an agent run and buffers its events."""
+ 
+@@ -28,9 +36,13 @@ def __init__(self, run_id: str, stream: bool = False) -> None:
          self.status: str | None = None
          self.summary: str | None = None
          self.complete_event = asyncio.Event()
@@ -419,11 +494,15 @@ index 3a7e356..27ca31a 100644
 +        # Assistant text may arrive as cumulative snapshots or append deltas.
          self._full_text: str = ""
 -        self._stream_queue: asyncio.Queue[str | None] | None = (
-+        self._stream_queue: asyncio.Queue[str | AgentExecutionError | None] | None = (
++        self._emitted_text: str = ""
++        self._assistant_item_id: str | None = None
++        self._assistant_item_prefix: str = ""
++        self._assistant_item_text: str = ""
++        self._stream_queue: asyncio.Queue[str | AgentTextReplacement | None] | None = (
              asyncio.Queue() if stream else None
          )
          self._streamed_any = False
-@@ -64,20 +64,52 @@ def add_output(self, output: str) -> None:
+@@ -64,22 +76,79 @@ def add_output(self, output: str) -> None:
                      len(self._full_text),
                  )
          else:
@@ -440,19 +519,16 @@ index 3a7e356..27ca31a 100644
 +            # current assistant item rather than appending duplicate text.
 +            self.replace_output(output)
 +            return
- 
-         if new_text and self._stream_queue is not None:
-             self._stream_queue.put_nowait(new_text)
-             self._streamed_any = True
- 
++
++        if new_text:
++            self._publish_text()
++
 +    def add_delta(self, delta: str) -> None:
 +        """Append a Gateway assistant data.delta update."""
 +        if not delta:
 +            return
 +        self._full_text += delta
-+        if self._stream_queue is not None:
-+            self._stream_queue.put_nowait(delta)
-+            self._streamed_any = True
++        self._publish_text()
 +
 +    def replace_output(self, output: str) -> None:
 +        """Apply an authoritative replacement, including an empty retraction.
@@ -461,49 +537,114 @@ index 3a7e356..27ca31a 100644
 +        Home Assistant ChatLog. Signal that case explicitly instead of
 +        appending a conflicting replacement to the visible answer.
 +        """
-+        previous = self._full_text
 +        self._full_text = output
-+        if self._stream_queue is None:
-+            return
-+        if output.startswith(previous):
-+            extra = output[len(previous):]
-+            if extra:
-+                self._stream_queue.put_nowait(extra)
-+                self._streamed_any = True
-+        elif previous:
-+            _LOGGER.warning(
-+                "Agent %s replaced already buffered text; streaming cannot retract it",
-+                self.run_id,
-+            )
-+            self._stream_queue.put_nowait(
-+                AgentExecutionError("Gateway replaced previously streamed assistant text")
-+            )
-+        elif output:
-+            self._stream_queue.put_nowait(output)
-+            self._streamed_any = True
++        self._publish_text()
 +
++    def _publish_text(self) -> None:
++        """Queue new text, or a corrected message if the prefix changed."""
++        if self._stream_queue is None or self._emitted_text == self._full_text:
++            return
++        if self._full_text.startswith(self._emitted_text):
++            self._stream_queue.put_nowait(self._full_text[len(self._emitted_text):])
++        else:
++            self._stream_queue.put_nowait(AgentTextReplacement(self._full_text))
++        self._emitted_text = self._full_text
++        self._streamed_any = True
++
++    def add_assistant_event(self, data: dict[str, Any]) -> None:
++        """Reconstruct v4 item-scoped text, never double-counting snapshots."""
++        snapshot = data.get("text")
++        delta = data.get("delta")
++        if not isinstance(snapshot, str) and not isinstance(delta, str):
++            return
+ 
+-        if new_text and self._stream_queue is not None:
+-            self._stream_queue.put_nowait(new_text)
+-            self._streamed_any = True
++        item_id = data.get("itemId")
++        replace = data.get("replace") is True
++        if not isinstance(item_id, str) or not item_id:
++            if isinstance(snapshot, str):
++                self.replace_output(snapshot)
++            elif replace:
++                self.replace_output(delta)
++            else:
++                self.add_delta(delta)
++            return
++
++        if item_id != self._assistant_item_id:
++            self._assistant_item_id = item_id
++            self._assistant_item_prefix = "" if replace else self._full_text
++            if self._assistant_item_prefix and not self._assistant_item_prefix.endswith("\n\n"):
++                self._assistant_item_prefix += "\n\n"
++            self._assistant_item_text = ""
++
++        if isinstance(snapshot, str):
++            self._assistant_item_text = snapshot
++        elif replace:
++            self._assistant_item_text = delta
++        else:
++            self._assistant_item_text += delta
++        self.replace_output(self._assistant_item_prefix + self._assistant_item_text)
+ 
      def set_complete(self, status: str, summary: str | None = None) -> None:
          """Mark run as complete."""
++        if self.complete_event.is_set():
++            return
          self.status = status
-@@ -113,6 +145,8 @@ async def get_chunk(self, timeout: float) -> str | None:
-         if self._stream_done:
-             return None
-         chunk = await asyncio.wait_for(self._stream_queue.get(), timeout=timeout)
-+        if isinstance(chunk, AgentExecutionError):
-+            raise chunk
-         if chunk is None:
+         self.summary = summary
+         self.complete_event.set()
+@@ -90,18 +159,17 @@ def set_complete(self, status: str, summary: str | None = None) -> None:
+             # suppress the conversation entity's friendly error fallback.
+             # stream_agent_request still raises on error status once the queue
+             # drains, so the caller fails cleanly.
+-            if status == "ok" and summary and not self._streamed_any:
+-                self._stream_queue.put_nowait(summary)
+-                self._streamed_any = True
++            if status == "ok" and summary is not None:
++                self.replace_output(summary)
+             self._stream_queue.put_nowait(None)
+ 
+     def get_response(self) -> str:
+         """Get assembled response."""
+-        if self.summary:
++        if self.summary is not None:
+             return self.summary
+         return self._full_text
+ 
+-    async def get_chunk(self, timeout: float) -> str | None:
++    async def get_chunk(self, timeout: float) -> str | AgentTextReplacement | None:
+         """Await the next streamed chunk; None is the completion sentinel.
+ 
+         Used to peek for first content during the grace race. Raises
+@@ -117,7 +185,7 @@ async def get_chunk(self, timeout: float) -> str | None:
              self._stream_done = True
          return chunk
-@@ -138,6 +172,8 @@ async def iter_stream(self, timeout: float) -> AsyncIterator[str]:
-             if chunk is None:
-                 self._stream_done = True
-                 break
-+            if isinstance(chunk, AgentExecutionError):
-+                raise chunk
-             yield chunk
  
+-    async def iter_stream(self, timeout: float) -> AsyncIterator[str]:
++    async def iter_stream(self, timeout: float) -> AsyncIterator[str | AgentTextReplacement]:
+         """Yield output chunks until completion or timeout.
  
-@@ -516,9 +552,30 @@ def _buffer_agent_payload(agent_run: AgentRun, payload: dict[str, Any]) -> None:
+         The timeout applies per-chunk: each new chunk resets the clock.
+@@ -446,7 +514,7 @@ async def wait_run(self, agent_run: AgentRun, timeout: float) -> str:
+         finally:
+             self._agent_runs.pop(agent_run.run_id, None)
+ 
+-    async def stream_run(self, agent_run: AgentRun) -> AsyncIterator[str]:
++    async def stream_run(self, agent_run: AgentRun) -> AsyncIterator[str | AgentTextReplacement]:
+         """Consume an already-started run: yield chunks, raise on failure.
+ 
+         Exactly one consumer per run — this owns cleanup of the run tracker.
+@@ -476,7 +544,7 @@ async def stream_run(self, agent_run: AgentRun) -> AsyncIterator[str]:
+ 
+     async def stream_agent_request(
+         self, message: str, idempotency_key: str | None = None
+-    ) -> AsyncIterator[str]:
++    ) -> AsyncIterator[str | AgentTextReplacement]:
+         """
+         Send agent request and stream response chunks.
+ 
+@@ -516,18 +584,32 @@ def _buffer_agent_payload(agent_run: AgentRun, payload: dict[str, Any]) -> None:
          if not isinstance(data, dict):
              data = {}
  
@@ -511,40 +652,53 @@ index 3a7e356..27ca31a 100644
 +        # data.text, when supplied, is an authoritative snapshot *including*
 +        # the delta in the same event. Never append both.
 +        stream = payload.get("stream")
-+        if stream in (None, "assistant"):
-+            snapshot = data.get("text")
-+            if isinstance(snapshot, str):
-+                if data.get("replace") and not snapshot:
-+                    agent_run.replace_output("")
-+                else:
-+                    agent_run.add_output(snapshot)
++        if stream in (None, "assistant") and (
++            isinstance(data.get("text"), str)
++            or isinstance(data.get("delta"), str)
++        ):
++            agent_run.add_assistant_event(data)
++            return
++
++        # Final action results can supersede provisional assistant items.
++        result = payload.get("result")
++        if isinstance(result, dict) and isinstance(result.get("payloads"), list):
++            texts = [
++                item["text"]
++                for item in result["payloads"]
++                if isinstance(item, dict) and isinstance(item.get("text"), str)
++            ]
++            if texts:
++                agent_run.replace_output("\n\n".join(text for text in texts if text))
 +                return
 +
-+            delta = data.get("delta")
-+            if isinstance(delta, str):
-+                if data.get("replace"):
-+                    agent_run.replace_output(delta)
-+                else:
-+                    agent_run.add_delta(delta)
-+                return
-+
-+        # Legacy gateways and action runs return a cumulative output or a
-+        # result.payloads text rather than v4 assistant deltas.
++        # Legacy gateways send cumulative top-level output.
          output = payload.get("output")
 -        if not output and "text" in data:
 -            output = data.get("text")
-         if not output:
-             result = payload.get("result")
-             if isinstance(result, dict):
-@@ -527,7 +584,7 @@ def _buffer_agent_payload(agent_run: AgentRun, payload: dict[str, Any]) -> None:
-                         output = item["text"]
-                         break
- 
+-        if not output:
+-            result = payload.get("result")
+-            if isinstance(result, dict):
+-                for item in result.get("payloads", []):
+-                    if isinstance(item, dict) and item.get("text"):
+-                        output = item["text"]
+-                        break
+-
 -        if output:
 +        if isinstance(output, str) and output:
              agent_run.add_output(output)
  
      @staticmethod
+@@ -593,8 +675,8 @@ def _handle_agent_event(self, event: dict[str, Any]) -> None:
+         phase = data.get("phase")
+         run_terminal = self._is_run_lifecycle_event(stream, data)
+ 
+-        if status in ("ok", "error"):
+-            # Legacy completion signalled by a top-level status field.
++        if status in ("ok", "error") and run_terminal:
++            # A per-item status must not complete the entire run.
+             summary = payload.get("summary")
+             agent_run.set_complete(status, summary)
+             _LOGGER.info("Agent run %s completed with status: %s", run_id, status)
 diff --git a/custom_components/openclaw/strings.json b/custom_components/openclaw/strings.json
 index d1043a4..b7ca8ad 100644
 --- a/custom_components/openclaw/strings.json
@@ -787,7 +941,7 @@ index 4283d88..e4ce552 100644
          assert entity.hass.services.calls == []
  
 diff --git a/tests/test_conversation_continue.py b/tests/test_conversation_continue.py
-index 0e67d23..43f7d1d 100644
+index 0e67d23..e4c484c 100644
 --- a/tests/test_conversation_continue.py
 +++ b/tests/test_conversation_continue.py
 @@ -4,9 +4,7 @@
@@ -809,7 +963,7 @@ index 0e67d23..43f7d1d 100644
          "background_enabled": False,
      }
      entry.options = {}
-@@ -100,11 +99,65 @@ async def fake_send(_message: str, **_kw) -> str:
+@@ -100,33 +99,115 @@ async def fake_send(_message: str, **_kw) -> str:
      assert result.continue_conversation is False
  
  
@@ -827,31 +981,33 @@ index 0e67d23..43f7d1d 100644
 +    entry.data.pop("streaming_enabled")
 +    entity = conv.OpenClawConversationEntity(entry, gateway)
 +    chat_log = conv.conversation.ChatLog()
-+
+ 
 +    result = await entity._async_handle_message(_make_user_input(), chat_log)
  
+-async def test_streaming_primary_path_sets_continue() -> None:
+-    conv = load_conversation_module(streaming="primary")
 +    assert entity._attr_supports_streaming is False
 +    assert chat_log.deltas == []
 +    assert result.response.speech == "Full response " * 230
 +    gateway.stream_agent_request.assert_not_called()
- 
--async def test_streaming_primary_path_sets_continue() -> None:
--    conv = load_conversation_module(streaming="primary")
++
 +
 +async def test_chatlog_streaming_opt_in_without_tts_limit() -> None:
 +    """Voice installations can explicitly opt in to incremental ChatLog output."""
 +    conv = load_conversation_module(streaming="chatlog")
-+    gateway = _make_gateway()
-+
-+    async def fake_stream(_message: str, **_kw) -> AsyncIterator[str]:
+     gateway = _make_gateway()
+ 
+     async def fake_stream(_message: str, **_kw) -> AsyncIterator[str]:
+-        for chunk in ("Here you go. ", "Want more detail?"):
+-            yield chunk
 +        yield "Chunk one"
 +        yield " and two"
-+
-+    gateway.stream_agent_request = fake_stream
+ 
+     gateway.stream_agent_request = fake_stream
 +    entry = _make_entry()
 +    entity = conv.OpenClawConversationEntity(entry, gateway)
 +    chat_log = conv.conversation.ChatLog()
-+
+ 
 +    result = await entity._async_handle_message(_make_user_input(), chat_log)
 +
 +    assert entity._attr_supports_streaming is True
@@ -863,9 +1019,40 @@ index 0e67d23..43f7d1d 100644
 +    assert result.response.speech == "Chunk one and two"
 +
 +
++async def test_streaming_terminal_replacement_updates_intent_end() -> None:
++    """A non-prefix final answer becomes the ChatLog's last assistant item."""
++    conv = load_conversation_module(streaming="chatlog")
++    from custom_components.openclaw.gateway_client import AgentTextReplacement
++
++    gateway = _make_gateway()
++
++    async def fake_stream(_message: str, **_kw):
++        yield "Home"
++        yield AgentTextReplacement("La domotique contrôle la maison.")
++
++    gateway.stream_agent_request = fake_stream
+     entity = conv.OpenClawConversationEntity(_make_entry(), gateway)
+-    result = await entity._async_handle_message(_make_user_input(), FakeChatLog())
++    chat_log = conv.conversation.ChatLog()
++
++    result = await entity._async_handle_message(_make_user_input(), chat_log)
++
++    assert chat_log.deltas == [
++        {"role": "assistant"},
++        {"content": "Home"},
++        {"role": "assistant", "content": "La domotique contrôle la maison."},
++    ]
++    assert result.response.speech == "La domotique contrôle la maison."
++
++
 +# ---------- streaming via ChatLog deltas ----------
-+
-+
+ 
+-    # Sanity: the primary path returns the original ConversationResult with
+-    # the async generator attached as `response_stream`.
+-    assert hasattr(result, "response_stream")
+-    async for _ in result.response_stream:
+-        pass
+ 
 +async def test_supports_streaming_detects_chatlog_api() -> None:
 +    conv = load_conversation_module(streaming="chatlog")
 +    assert conv.OpenClawConversationEntity._supports_streaming_result() is True
@@ -875,21 +1062,15 @@ index 0e67d23..43f7d1d 100644
 +
 +async def test_streaming_sets_continue_on_question() -> None:
 +    conv = load_conversation_module(streaming="chatlog")
-     gateway = _make_gateway()
- 
-     async def fake_stream(_message: str, **_kw) -> AsyncIterator[str]:
-@@ -114,19 +167,22 @@ async def fake_stream(_message: str, **_kw) -> AsyncIterator[str]:
-     gateway.stream_agent_request = fake_stream
- 
-     entity = conv.OpenClawConversationEntity(_make_entry(), gateway)
--    result = await entity._async_handle_message(_make_user_input(), FakeChatLog())
--
--    # Sanity: the primary path returns the original ConversationResult with
--    # the async generator attached as `response_stream`.
--    assert hasattr(result, "response_stream")
--    async for _ in result.response_stream:
--        pass
--
++    gateway = _make_gateway()
++
++    async def fake_stream(_message: str, **_kw) -> AsyncIterator[str]:
++        for chunk in ("Here you go. ", "Want more detail?"):
++            yield chunk
++
++    gateway.stream_agent_request = fake_stream
++
++    entity = conv.OpenClawConversationEntity(_make_entry(), gateway)
 +    chat_log = conv.conversation.ChatLog()
 +    result = await entity._async_handle_message(_make_user_input(), chat_log)
 +
@@ -911,7 +1092,7 @@ index 0e67d23..43f7d1d 100644
      gateway = _make_gateway()
  
      async def fake_stream(_message: str, **_kw) -> AsyncIterator[str]:
-@@ -136,38 +192,98 @@ async def fake_stream(_message: str, **_kw) -> AsyncIterator[str]:
+@@ -136,38 +217,98 @@ async def fake_stream(_message: str, **_kw) -> AsyncIterator[str]:
      gateway.stream_agent_request = fake_stream
  
      entity = conv.OpenClawConversationEntity(_make_entry(), gateway)
@@ -973,19 +1154,19 @@ index 0e67d23..43f7d1d 100644
 +    result = await entity._async_handle_message(
 +        _make_user_input(), conv.conversation.ChatLog()
 +    )
++
++    assert result.response.speech == "The response took too long. Please try again."
++    assert result.continue_conversation is False
  
 -    # Fallback path must return the StreamingConversationResult instance,
 -    # not the original ConversationResult.
 -    assert type(result).__name__ == "StreamingConversationResult"
 -    async for _ in result.response_stream:
 -        pass
-+    assert result.response.speech == "The response took too long. Please try again."
-+    assert result.continue_conversation is False
  
 -    # Before the fix this was `False` because the generator's finally block
 -    # mutated a different object than the one returned to HA.
 -    assert result.continue_conversation is True
-+
 +async def test_streaming_error_after_content_keeps_partial_reply() -> None:
 +    conv = load_conversation_module(streaming="chatlog")
 +    from custom_components.openclaw.exceptions import GatewayConnectionError
@@ -1028,10 +1209,53 @@ index 0e67d23..43f7d1d 100644
  
  # ---------- error path ----------
 diff --git a/tests/test_gateway_client.py b/tests/test_gateway_client.py
-index 21d43a8..dc9b2be 100644
+index 21d43a8..006d717 100644
 --- a/tests/test_gateway_client.py
 +++ b/tests/test_gateway_client.py
-@@ -81,6 +81,101 @@ async def test_error_summary_not_streamed_as_content(self) -> None:
+@@ -70,6 +70,42 @@ async def test_ok_summary_streamed_when_no_tokens(self) -> None:
+         chunks = [chunk async for chunk in run.iter_stream(timeout=1.0)]
+         assert chunks == ["Final answer"]
+ 
++    @pytest.mark.asyncio
++    async def test_final_summary_appends_missing_suffix(self) -> None:
++        run = AgentRun("run-1", stream=True)
++        run.add_delta("Home")
++        run.set_complete("ok", "Home Assistant automatise la maison.")
++        chunks = [chunk async for chunk in run.iter_stream(timeout=1.0)]
++        assert chunks == ["Home", " Assistant automatise la maison."]
++        assert "".join(chunks) == run.get_response()
++
++    @pytest.mark.asyncio
++    async def test_final_summary_replaces_nonprefix_content(self) -> None:
++        run = AgentRun("run-1", stream=True)
++        run.add_delta("Home")
++        run.set_complete("ok", "La domotique contrôle la maison.")
++        chunks = [chunk async for chunk in run.iter_stream(timeout=1.0)]
++        assert chunks[0] == "Home"
++        assert isinstance(chunks[1], _gateway_client.AgentTextReplacement)
++        assert chunks[1].text == run.get_response()
++
++    @pytest.mark.asyncio
++    async def test_final_summary_equal_to_stream_not_duplicated(self) -> None:
++        run = AgentRun("run-1", stream=True)
++        run.add_delta("Home Assistant")
++        run.set_complete("ok", "Home Assistant")
++        assert [chunk async for chunk in run.iter_stream(timeout=1.0)] == ["Home Assistant"]
++
++    @pytest.mark.asyncio
++    async def test_no_final_summary_keeps_streamed_answer(self) -> None:
++        run = AgentRun("run-1", stream=True)
++        run.add_delta("Home")
++        run.add_delta(" Assistant")
++        run.set_complete("ok", None)
++        assert [chunk async for chunk in run.iter_stream(timeout=1.0)] == [
++            "Home", " Assistant"
++        ]
++
+     @pytest.mark.asyncio
+     async def test_error_summary_not_streamed_as_content(self) -> None:
+         # On error the summary is an internal diagnostic; it must not be
+@@ -81,7 +117,145 @@ async def test_error_summary_not_streamed_as_content(self) -> None:
          assert chunks == []
  
  
@@ -1122,14 +1346,58 @@ index 21d43a8..dc9b2be 100644
 +        assert client._agent_runs == {}
 +
 +    @pytest.mark.asyncio
-+    async def test_streamed_replacement_fails_instead_of_duplicating(self) -> None:
++    async def test_streamed_replacement_emits_corrected_message(self) -> None:
 +        run = AgentRun("run-1", stream=True)
 +        run.add_delta("Draft")
 +        run.replace_output("Corrected")
 +        run.set_complete("ok")
-+        with pytest.raises(AgentExecutionError, match="replaced"):
-+            _ = [chunk async for chunk in run.iter_stream(timeout=1)]
++        chunks = [chunk async for chunk in run.iter_stream(timeout=1)]
++        assert chunks[0] == "Draft"
++        assert isinstance(chunks[1], _gateway_client.AgentTextReplacement)
++        assert chunks[1].text == "Corrected"
 +
  class TestHandleAgentEvent:
++    def test_result_payloads_reconcile_stream_and_include_all_messages(self) -> None:
++        client = OpenClawGatewayClient("localhost", 1, None)
++        run = AgentRun("run-1", stream=True)
++        client._agent_runs["run-1"] = run
++
++        client._handle_agent_event({
++            "payload": {"runId": "run-1", "stream": "assistant",
++                        "data": {"delta": "Home"}}
++        })
++        client._handle_agent_event({
++            "payload": {"runId": "run-1", "result": {
++                "payloads": [{"text": "Home Assistant"}, {"text": "Deuxième réponse."}]
++            }}
++        })
++        assert run.get_response() == "Home Assistant\n\nDeuxième réponse."
++
++    def test_item_scoped_snapshots_preserve_previous_items(self) -> None:
++        client = OpenClawGatewayClient("localhost", 1, None)
++        run = AgentRun("run-1")
++        client._agent_runs["run-1"] = run
++        for data in (
++            {"itemId": "first", "text": "Hello", "delta": "Hello"},
++            {"itemId": "first", "delta": " world"},
++            {"itemId": "second", "text": "Second"},
++            {"itemId": "second", "delta": " item"},
++        ):
++            client._handle_agent_event({
++                "payload": {"runId": "run-1", "stream": "assistant", "data": data}
++            })
++        assert run.get_response() == "Hello world\n\nSecond item"
++
++    def test_per_item_status_does_not_complete_run(self) -> None:
++        client = OpenClawGatewayClient("localhost", 1, None)
++        run = AgentRun("run-1")
++        client._agent_runs["run-1"] = run
++        client._handle_agent_event({
++            "payload": {"runId": "run-1", "stream": "assistant",
++                        "status": "ok", "data": {"itemId": "one"}}
++        })
++        assert not run.complete_event.is_set()
++
      def test_buffers_output_from_data_text(self) -> None:
          client = OpenClawGatewayClient("localhost", 1, None)
+         run = AgentRun("run-1")
