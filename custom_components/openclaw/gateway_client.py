@@ -28,9 +28,9 @@ class AgentRun:
         self.status: str | None = None
         self.summary: str | None = None
         self.complete_event = asyncio.Event()
-        # Gateway sends cumulative text, not incremental
+        # Assistant text may arrive as cumulative snapshots or append deltas.
         self._full_text: str = ""
-        self._stream_queue: asyncio.Queue[str | None] | None = (
+        self._stream_queue: asyncio.Queue[str | AgentExecutionError | None] | None = (
             asyncio.Queue() if stream else None
         )
         self._streamed_any = False
@@ -64,18 +64,50 @@ class AgentRun:
                     len(self._full_text),
                 )
         else:
-            # Not cumulative (shouldn't happen), just replace
-            _LOGGER.warning(
-                "Non-cumulative text update for %s (was: %d, now: %d)",
-                self.run_id,
-                len(self._full_text),
-                len(output),
-            )
-            new_text = output
-            self._full_text = output
+            # An authoritative snapshot that is not an extension replaces the
+            # current assistant item rather than appending duplicate text.
+            self.replace_output(output)
+            return
 
         if new_text and self._stream_queue is not None:
             self._stream_queue.put_nowait(new_text)
+            self._streamed_any = True
+
+    def add_delta(self, delta: str) -> None:
+        """Append a Gateway assistant data.delta update."""
+        if not delta:
+            return
+        self._full_text += delta
+        if self._stream_queue is not None:
+            self._stream_queue.put_nowait(delta)
+            self._streamed_any = True
+
+    def replace_output(self, output: str) -> None:
+        """Apply an authoritative replacement, including an empty retraction.
+
+        A streaming consumer cannot retract text already delivered to the
+        Home Assistant ChatLog. Signal that case explicitly instead of
+        appending a conflicting replacement to the visible answer.
+        """
+        previous = self._full_text
+        self._full_text = output
+        if self._stream_queue is None:
+            return
+        if output.startswith(previous):
+            extra = output[len(previous):]
+            if extra:
+                self._stream_queue.put_nowait(extra)
+                self._streamed_any = True
+        elif previous:
+            _LOGGER.warning(
+                "Agent %s replaced already buffered text; streaming cannot retract it",
+                self.run_id,
+            )
+            self._stream_queue.put_nowait(
+                AgentExecutionError("Gateway replaced previously streamed assistant text")
+            )
+        elif output:
+            self._stream_queue.put_nowait(output)
             self._streamed_any = True
 
     def set_complete(self, status: str, summary: str | None = None) -> None:
@@ -113,6 +145,8 @@ class AgentRun:
         if self._stream_done:
             return None
         chunk = await asyncio.wait_for(self._stream_queue.get(), timeout=timeout)
+        if isinstance(chunk, AgentExecutionError):
+            raise chunk
         if chunk is None:
             self._stream_done = True
         return chunk
@@ -138,6 +172,8 @@ class AgentRun:
             if chunk is None:
                 self._stream_done = True
                 break
+            if isinstance(chunk, AgentExecutionError):
+                raise chunk
             yield chunk
 
 
@@ -516,9 +552,30 @@ class OpenClawGatewayClient:
         if not isinstance(data, dict):
             data = {}
 
+        # Modern v4 assistant events send incremental data.delta updates.
+        # data.text, when supplied, is an authoritative snapshot *including*
+        # the delta in the same event. Never append both.
+        stream = payload.get("stream")
+        if stream in (None, "assistant"):
+            snapshot = data.get("text")
+            if isinstance(snapshot, str):
+                if data.get("replace") and not snapshot:
+                    agent_run.replace_output("")
+                else:
+                    agent_run.add_output(snapshot)
+                return
+
+            delta = data.get("delta")
+            if isinstance(delta, str):
+                if data.get("replace"):
+                    agent_run.replace_output(delta)
+                else:
+                    agent_run.add_delta(delta)
+                return
+
+        # Legacy gateways and action runs return a cumulative output or a
+        # result.payloads text rather than v4 assistant deltas.
         output = payload.get("output")
-        if not output and "text" in data:
-            output = data.get("text")
         if not output:
             result = payload.get("result")
             if isinstance(result, dict):
@@ -527,7 +584,7 @@ class OpenClawGatewayClient:
                         output = item["text"]
                         break
 
-        if output:
+        if isinstance(output, str) and output:
             agent_run.add_output(output)
 
     @staticmethod
