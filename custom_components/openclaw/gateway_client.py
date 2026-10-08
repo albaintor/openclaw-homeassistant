@@ -39,6 +39,9 @@ class AgentRun:
         # Assistant text may arrive as cumulative snapshots or append deltas.
         self._full_text: str = ""
         self._emitted_text: str = ""
+        self._assistant_item_id: str | None = None
+        self._assistant_item_prefix: str = ""
+        self._assistant_item_text: str = ""
         self._stream_queue: asyncio.Queue[str | AgentTextReplacement | None] | None = (
             asyncio.Queue() if stream else None
         )
@@ -95,7 +98,6 @@ class AgentRun:
         Home Assistant ChatLog. Signal that case explicitly instead of
         appending a conflicting replacement to the visible answer.
         """
-        previous = self._full_text
         self._full_text = output
         self._publish_text()
 
@@ -110,8 +112,43 @@ class AgentRun:
         self._emitted_text = self._full_text
         self._streamed_any = True
 
+    def add_assistant_event(self, data: dict[str, Any]) -> None:
+        """Reconstruct v4 item-scoped text, never double-counting snapshots."""
+        snapshot = data.get("text")
+        delta = data.get("delta")
+        if not isinstance(snapshot, str) and not isinstance(delta, str):
+            return
+
+        item_id = data.get("itemId")
+        replace = data.get("replace") is True
+        if not isinstance(item_id, str) or not item_id:
+            if isinstance(snapshot, str):
+                self.replace_output(snapshot)
+            elif replace:
+                self.replace_output(delta)
+            else:
+                self.add_delta(delta)
+            return
+
+        if item_id != self._assistant_item_id:
+            self._assistant_item_id = item_id
+            self._assistant_item_prefix = "" if replace else self._full_text
+            if self._assistant_item_prefix and not self._assistant_item_prefix.endswith("\n\n"):
+                self._assistant_item_prefix += "\n\n"
+            self._assistant_item_text = ""
+
+        if isinstance(snapshot, str):
+            self._assistant_item_text = snapshot
+        elif replace:
+            self._assistant_item_text = delta
+        else:
+            self._assistant_item_text += delta
+        self.replace_output(self._assistant_item_prefix + self._assistant_item_text)
+
     def set_complete(self, status: str, summary: str | None = None) -> None:
         """Mark run as complete."""
+        if self.complete_event.is_set():
+            return
         self.status = status
         self.summary = summary
         self.complete_event.set()
@@ -123,13 +160,12 @@ class AgentRun:
             # stream_agent_request still raises on error status once the queue
             # drains, so the caller fails cleanly.
             if status == "ok" and summary is not None:
-                self._full_text = summary
-                self._publish_text()
+                self.replace_output(summary)
             self._stream_queue.put_nowait(None)
 
     def get_response(self) -> str:
         """Get assembled response."""
-        if self.summary:
+        if self.summary is not None:
             return self.summary
         return self._full_text
 
