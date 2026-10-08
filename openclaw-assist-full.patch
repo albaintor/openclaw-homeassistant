@@ -461,7 +461,7 @@ index 36122ad..fa8a03b 100644
      def _finalize_response(
          self,
 diff --git a/custom_components/openclaw/gateway_client.py b/custom_components/openclaw/gateway_client.py
-index 3a7e356..46965a4 100644
+index 3a7e356..8cc4d1c 100644
 --- a/custom_components/openclaw/gateway_client.py
 +++ b/custom_components/openclaw/gateway_client.py
 @@ -1,6 +1,7 @@
@@ -522,7 +522,10 @@ index 3a7e356..46965a4 100644
 +
 +        if new_text:
 +            self._publish_text()
-+
+ 
+-        if new_text and self._stream_queue is not None:
+-            self._stream_queue.put_nowait(new_text)
+-            self._streamed_any = True
 +    def add_delta(self, delta: str) -> None:
 +        """Append a Gateway assistant data.delta update."""
 +        if not delta:
@@ -557,10 +560,7 @@ index 3a7e356..46965a4 100644
 +        delta = data.get("delta")
 +        if not isinstance(snapshot, str) and not isinstance(delta, str):
 +            return
- 
--        if new_text and self._stream_queue is not None:
--            self._stream_queue.put_nowait(new_text)
--            self._streamed_any = True
++
 +        item_id = data.get("itemId")
 +        replace = data.get("replace") is True
 +        if not isinstance(item_id, str) or not item_id:
@@ -594,21 +594,28 @@ index 3a7e356..46965a4 100644
          self.status = status
          self.summary = summary
          self.complete_event.set()
-@@ -90,18 +159,17 @@ def set_complete(self, status: str, summary: str | None = None) -> None:
+@@ -90,9 +159,17 @@ def set_complete(self, status: str, summary: str | None = None) -> None:
              # suppress the conversation entity's friendly error fallback.
              # stream_agent_request still raises on error status once the queue
              # drains, so the caller fails cleanly.
 -            if status == "ok" and summary and not self._streamed_any:
 -                self._stream_queue.put_nowait(summary)
 -                self._streamed_any = True
-+            if status == "ok" and summary is not None:
++            if status == "ok" and summary:
 +                self.replace_output(summary)
++            _LOGGER.debug(
++                "Run %s finished: status=%s, final_chars=%d, queued_chars=%d, "
++                "summary_present=%s",
++                self.run_id,
++                status,
++                len(self.get_response()) if status == "ok" else 0,
++                len(self._emitted_text),
++                bool(summary),
++            )
              self._stream_queue.put_nowait(None)
  
      def get_response(self) -> str:
-         """Get assembled response."""
--        if self.summary:
-+        if self.summary is not None:
+@@ -101,7 +178,7 @@ def get_response(self) -> str:
              return self.summary
          return self._full_text
  
@@ -617,7 +624,7 @@ index 3a7e356..46965a4 100644
          """Await the next streamed chunk; None is the completion sentinel.
  
          Used to peek for first content during the grace race. Raises
-@@ -117,7 +185,7 @@ async def get_chunk(self, timeout: float) -> str | None:
+@@ -117,7 +194,7 @@ async def get_chunk(self, timeout: float) -> str | None:
              self._stream_done = True
          return chunk
  
@@ -626,7 +633,7 @@ index 3a7e356..46965a4 100644
          """Yield output chunks until completion or timeout.
  
          The timeout applies per-chunk: each new chunk resets the clock.
-@@ -446,7 +514,7 @@ async def wait_run(self, agent_run: AgentRun, timeout: float) -> str:
+@@ -446,7 +523,7 @@ async def wait_run(self, agent_run: AgentRun, timeout: float) -> str:
          finally:
              self._agent_runs.pop(agent_run.run_id, None)
  
@@ -635,7 +642,7 @@ index 3a7e356..46965a4 100644
          """Consume an already-started run: yield chunks, raise on failure.
  
          Exactly one consumer per run — this owns cleanup of the run tracker.
-@@ -476,7 +544,7 @@ async def stream_run(self, agent_run: AgentRun) -> AsyncIterator[str]:
+@@ -476,7 +553,7 @@ async def stream_run(self, agent_run: AgentRun) -> AsyncIterator[str]:
  
      async def stream_agent_request(
          self, message: str, idempotency_key: str | None = None
@@ -644,7 +651,7 @@ index 3a7e356..46965a4 100644
          """
          Send agent request and stream response chunks.
  
-@@ -516,18 +584,32 @@ def _buffer_agent_payload(agent_run: AgentRun, payload: dict[str, Any]) -> None:
+@@ -516,18 +593,32 @@ def _buffer_agent_payload(agent_run: AgentRun, payload: dict[str, Any]) -> None:
          if not isinstance(data, dict):
              data = {}
  
@@ -688,7 +695,7 @@ index 3a7e356..46965a4 100644
              agent_run.add_output(output)
  
      @staticmethod
-@@ -593,8 +675,8 @@ def _handle_agent_event(self, event: dict[str, Any]) -> None:
+@@ -593,8 +684,8 @@ def _handle_agent_event(self, event: dict[str, Any]) -> None:
          phase = data.get("phase")
          run_terminal = self._is_run_lifecycle_event(stream, data)
  
@@ -1209,10 +1216,10 @@ index 0e67d23..e4c484c 100644
  
  # ---------- error path ----------
 diff --git a/tests/test_gateway_client.py b/tests/test_gateway_client.py
-index 21d43a8..006d717 100644
+index 21d43a8..6adbb71 100644
 --- a/tests/test_gateway_client.py
 +++ b/tests/test_gateway_client.py
-@@ -70,6 +70,42 @@ async def test_ok_summary_streamed_when_no_tokens(self) -> None:
+@@ -70,6 +70,52 @@ async def test_ok_summary_streamed_when_no_tokens(self) -> None:
          chunks = [chunk async for chunk in run.iter_stream(timeout=1.0)]
          assert chunks == ["Final answer"]
  
@@ -1243,6 +1250,16 @@ index 21d43a8..006d717 100644
 +        assert [chunk async for chunk in run.iter_stream(timeout=1.0)] == ["Home Assistant"]
 +
 +    @pytest.mark.asyncio
++    async def test_empty_summary_preserves_buffered_reply(self) -> None:
++        run = AgentRun("run-1", stream=True)
++        run.add_delta("Home Assistant")
++        run.set_complete("ok", "")
++        assert run.get_response() == "Home Assistant"
++        assert [chunk async for chunk in run.iter_stream(timeout=1.0)] == [
++            "Home Assistant"
++        ]
++
++    @pytest.mark.asyncio
 +    async def test_no_final_summary_keeps_streamed_answer(self) -> None:
 +        run = AgentRun("run-1", stream=True)
 +        run.add_delta("Home")
@@ -1255,7 +1272,7 @@ index 21d43a8..006d717 100644
      @pytest.mark.asyncio
      async def test_error_summary_not_streamed_as_content(self) -> None:
          # On error the summary is an internal diagnostic; it must not be
-@@ -81,7 +117,145 @@ async def test_error_summary_not_streamed_as_content(self) -> None:
+@@ -81,7 +127,145 @@ async def test_error_summary_not_streamed_as_content(self) -> None:
          assert chunks == []
  
  
