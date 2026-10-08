@@ -1,8 +1,145 @@
+diff --git a/README.md b/README.md
+index a9ab32d..da08fd7 100644
+--- a/README.md
++++ b/README.md
+@@ -72,6 +72,7 @@ through your smart-home voice assistant.
+   (reminders, "task done", follow-ups) via `assist_satellite.announce` /
+   `start_conversation`. [Details ›](#proactive-voice)
+ - **TTS hygiene** — optional emoji stripping and length trimming for clean speech.
++- **Response delivery** — complete replies by default; opt-in ChatLog delta streaming for compatible Assist voice pipelines.
+ 
+ **Connection & auth**
+ - **Direct WebSocket** — real-time, persistent connection to the OpenClaw Gateway.
+@@ -222,6 +223,7 @@ All of these are editable any time via **Settings → Devices & Services → Ope
+ | **Thinking mode** | gateway default | `off` / `low` / `medium` / `high` |
+ | **Strip emojis from TTS** | On | Remove emojis from spoken output |
+ | **TTS max characters** | `0` (no limit) | Trim long spoken replies (0–2000) |
++| **Streaming responses** | Off | Opt in to incremental ChatLog replies when supported by your Assist client; off returns the entire response without a character cap |
+ | **Background work** | On | Slow requests answer later via announce instead of timing out |
+ | **Grace period** | `10` s | Silence before a request is deferred to background (3–60) |
+ | **Holding phrase** | “On it — I’ll let you know when it’s done.” | Spoken when a request is deferred |
+@@ -380,6 +382,19 @@ for cleaner TTS:
+ - Disable it if your TTS engine handles emojis well, or if you mostly use the text
+   Assist box.
+ 
++### Response streaming
++
++**Streaming responses** is off by default: the integration waits for OpenClaw's
++completed message and returns it to Home Assistant as one response. This avoids
++partial replies in text Assist on client/pipeline combinations that do not
++correctly present incremental ChatLog events. Unlike a positive **TTS max
++characters** value, this mode does **not** truncate responses.
++
++For a compatible voice pipeline, enable **Streaming responses** under
++**Configure** and set **TTS max characters** to `0`. This enables streaming via
++`ChatLog.async_add_delta_content_stream`. If Assist only displays an initial
++word, switch streaming off rather than increasing the TTS character limit.
++
+ ### TTS response trimming
+ 
+ **TTS max characters** caps spoken replies:
+diff --git a/custom_components/openclaw/config_flow.py b/custom_components/openclaw/config_flow.py
+index afb4a4a..4c70ceb 100644
+--- a/custom_components/openclaw/config_flow.py
++++ b/custom_components/openclaw/config_flow.py
+@@ -26,6 +26,7 @@
+     CONF_STRIP_EMOJIS,
+     CONF_THINKING,
+     CONF_TTS_MAX_CHARS,
++    CONF_STREAMING_ENABLED,
+     CONF_USE_SSL,
+     DEFAULT_AGENT_ID,
+     DEFAULT_BACKGROUND_ENABLED,
+@@ -40,6 +41,7 @@
+     DEFAULT_STRIP_EMOJIS,
+     DEFAULT_THINKING,
+     DEFAULT_TTS_MAX_CHARS,
++    DEFAULT_STREAMING_ENABLED,
+     DEFAULT_TIMEOUT,
+     DEFAULT_USE_SSL,
+     DOMAIN,
+@@ -512,6 +514,9 @@ async def async_step_init(
+                     CONF_TTS_MAX_CHARS: user_input.get(
+                         CONF_TTS_MAX_CHARS, DEFAULT_TTS_MAX_CHARS
+                     ),
++                    CONF_STREAMING_ENABLED: user_input.get(
++                        CONF_STREAMING_ENABLED, DEFAULT_STREAMING_ENABLED
++                    ),
+                 }
+                 self.hass.config_entries.async_update_entry(
+                     self.config_entry,
+@@ -566,6 +571,12 @@ async def async_step_init(
+                         CONF_TTS_MAX_CHARS, DEFAULT_TTS_MAX_CHARS
+                     ),
+                 ): vol.All(int, vol.Range(min=0, max=2000)),
++                vol.Optional(
++                    CONF_STREAMING_ENABLED,
++                    default=current.get(
++                        CONF_STREAMING_ENABLED, DEFAULT_STREAMING_ENABLED
++                    ),
++                ): bool,
+                 **_background_schema_fields(current),
+                 **_proactive_schema_fields(current),
+             }
+diff --git a/custom_components/openclaw/const.py b/custom_components/openclaw/const.py
+index e20ce77..7844fd4 100644
+--- a/custom_components/openclaw/const.py
++++ b/custom_components/openclaw/const.py
+@@ -11,7 +11,8 @@
+ DEFAULT_MODEL = None
+ DEFAULT_THINKING = None
+ DEFAULT_STRIP_EMOJIS = True  # Strip emojis from TTS by default
+-DEFAULT_TTS_MAX_CHARS = 0  # 0 disables TTS trimming
++DEFAULT_TTS_MAX_CHARS = 0  # 0 disables TTS trimming
++DEFAULT_STREAMING_ENABLED = False  # Only enable ChatLog streaming when explicitly opted in
+ DEFAULT_AGENT_ID = None  # Use gateway default agent
+ 
+ # Proactive voice: speak agent-initiated turns (cron/background/follow-ups) on a
+@@ -50,7 +51,8 @@
+ CONF_MODEL = "model"
+ CONF_THINKING = "thinking"
+ CONF_STRIP_EMOJIS = "strip_emojis"
+-CONF_TTS_MAX_CHARS = "tts_max_chars"
++CONF_TTS_MAX_CHARS = "tts_max_chars"
++CONF_STREAMING_ENABLED = "streaming_enabled"
+ CONF_PROACTIVE_ENABLED = "proactive_enabled"
+ CONF_PROACTIVE_SATELLITE = "proactive_satellite"
+ CONF_PROACTIVE_MODE = "proactive_mode"
 diff --git a/custom_components/openclaw/conversation.py b/custom_components/openclaw/conversation.py
-index 36122ad..edecc0a 100644
+index 36122ad..b21d18e 100644
 --- a/custom_components/openclaw/conversation.py
 +++ b/custom_components/openclaw/conversation.py
-@@ -204,21 +204,16 @@ async def _async_announce(
+@@ -26,6 +26,7 @@
+     CONF_PROACTIVE_SATELLITE,
+     CONF_STRIP_EMOJIS,
+     CONF_TTS_MAX_CHARS,
++    CONF_STREAMING_ENABLED,
+     DEFAULT_BACKGROUND_ENABLED,
+     DEFAULT_BACKGROUND_GRACE,
+     DEFAULT_HOLDING_PHRASE,
+@@ -33,6 +34,7 @@
+     DEFAULT_PROACTIVE_MODE,
+     DEFAULT_STRIP_EMOJIS,
+     DEFAULT_TTS_MAX_CHARS,
++    DEFAULT_STREAMING_ENABLED,
+     DOMAIN,
+     PROACTIVE_MODE_START_CONVERSATION,
+ )
+@@ -123,7 +125,12 @@ def __init__(
+         self._config_entry = config_entry
+         self._gateway_client = gateway_client
+         self._attr_unique_id = config_entry.entry_id
+-        self._attr_supports_streaming = self._supports_streaming_result()
++        options = {**config_entry.data, **config_entry.options}
++        self._attr_supports_streaming = (
++            options.get(CONF_STREAMING_ENABLED, DEFAULT_STREAMING_ENABLED)
++            and options.get(CONF_TTS_MAX_CHARS, DEFAULT_TTS_MAX_CHARS) == 0
++            and self._supports_streaming_result()
++        )
+         # Runs detached past the grace period, reporting back via announce.
+         self._background_tasks: set[asyncio.Task] = set()
+ 
+@@ -204,21 +211,16 @@ async def _async_announce(
  
      @staticmethod
      def _supports_streaming_result() -> bool:
@@ -34,7 +171,17 @@ index 36122ad..edecc0a 100644
  
      @property
      def device_info(self) -> dict[str, Any]:
-@@ -285,7 +280,7 @@ async def _async_handle_message(
+@@ -244,6 +246,9 @@ def extra_state_attributes(self) -> dict[str, Any]:
+             "thinking": self._gateway_client.thinking,
+             "strip_emojis": data.get(CONF_STRIP_EMOJIS, DEFAULT_STRIP_EMOJIS),
+             "tts_max_chars": data.get(CONF_TTS_MAX_CHARS, DEFAULT_TTS_MAX_CHARS),
++            "streaming_enabled": data.get(
++                CONF_STREAMING_ENABLED, DEFAULT_STREAMING_ENABLED
++            ),
+             "proactive_enabled": data.get(
+                 CONF_PROACTIVE_ENABLED, DEFAULT_PROACTIVE_ENABLED
+             ),
+@@ -285,7 +290,7 @@ async def _async_handle_message(
                      user_input, chat_log, user_message, config
                  )
  
@@ -43,7 +190,7 @@ index 36122ad..edecc0a 100644
                  user_input, chat_log, user_message
              )
              if streaming_result is not None:
-@@ -380,7 +375,7 @@ async def _handle_with_grace(
+@@ -380,7 +385,7 @@ async def _handle_with_grace(
                  user_input, chat_log, agent_run, config
              )
  
@@ -52,7 +199,7 @@ index 36122ad..edecc0a 100644
              user_input,
              chat_log,
              user_message,
-@@ -499,151 +494,92 @@ def _resolve_report_satellite(self, device_id: str | None) -> str | None:
+@@ -499,151 +504,96 @@ def _resolve_report_satellite(self, device_id: str | None) -> str | None:
          config = {**self._config_entry.data, **self._config_entry.options}
          return config.get(CONF_PROACTIVE_SATELLITE)
  
@@ -67,7 +214,8 @@ index 36122ad..edecc0a 100644
 -        """Build a streaming conversation result when supported."""
 -        if not self._supports_streaming_result():
 -            return None
--
++        """Stream the reply into the chat log so HA can start TTS early.
+ 
 -        intent_response = intent.IntentResponse(language=user_input.language)
 -        result = conversation.ConversationResult(
 -            response=intent_response,
@@ -91,14 +239,16 @@ index 36122ad..edecc0a 100644
 -            return result
 -        except AttributeError:
 -            pass
-+        """Stream the reply into the chat log so HA can start TTS early.
- 
+-
 -        streaming_cls = getattr(conversation, "StreamingConversationResult", None)
 -        if streaming_cls is None:
 +        Returns None when streaming is unavailable (or TTS trimming is on,
 +        which needs the full text), so callers fall back to a plain result.
 +        """
-+        if not self._supports_streaming_result():
++        config = {**self._config_entry.data, **self._config_entry.options}
++        # Assist text sessions must be able to wait for the final answer; the
++        # optional ChatLog streaming path is not reliable on every HA client.
++        if not config.get(CONF_STREAMING_ENABLED, DEFAULT_STREAMING_ENABLED):
              return None
 -
 -        init_attempts = [
@@ -134,7 +284,8 @@ index 36122ad..edecc0a 100644
 -            _LOGGER.debug(
 -                "StreamingConversationResult signature not supported by this HA version"
 -            )
-+        config = {**self._config_entry.data, **self._config_entry.options}
++        if not self._supports_streaming_result():
++            return None
 +        if config.get(CONF_TTS_MAX_CHARS, DEFAULT_TTS_MAX_CHARS) > 0:
              return None
 -        result_ref[0] = streamed
@@ -557,7 +708,7 @@ index 3b53193..087f46a 100644
      conversation_mod.AssistantContent = AssistantContent
      conversation_mod.ConversationInput = ConversationInput
 diff --git a/tests/test_background_defer.py b/tests/test_background_defer.py
-index 4283d88..573a668 100644
+index 4283d88..e4ce552 100644
 --- a/tests/test_background_defer.py
 +++ b/tests/test_background_defer.py
 @@ -17,8 +17,8 @@
@@ -571,7 +722,17 @@ index 4283d88..573a668 100644
  _conv_plain = load_conversation_module(streaming="none")
  
  RUN_ID = "r1"
-@@ -115,15 +115,24 @@ class TestFastPath:
+@@ -74,6 +74,9 @@ def __init__(self, options: dict) -> None:
+ 
+ def _make_env(mod, options: dict, timeout: float = 5.0):
+     """Real client with a stubbed gateway transport; events drive the run."""
++    # Tests parametrized with _conv_stream explicitly opt in; normal installs
++    # retain the reliable complete-response path by default.
++    options = {**options, "streaming_enabled": mod is _conv_stream}
+     client = mod.OpenClawGatewayClient("localhost", 1, None, timeout=timeout)
+     client._resolved_agent_id = "main"
+ 
+@@ -115,15 +118,24 @@ class TestFastPath:
      @pytest.mark.asyncio
      async def test_streaming_result_streams_inline(self) -> None:
          client, entity = _make_env(_conv_stream, {"background_grace": 0.5})
@@ -602,7 +763,7 @@ index 4283d88..573a668 100644
          assert entity.hass.services.calls == []
  
 diff --git a/tests/test_conversation_continue.py b/tests/test_conversation_continue.py
-index 0e67d23..62abaaf 100644
+index 0e67d23..43f7d1d 100644
 --- a/tests/test_conversation_continue.py
 +++ b/tests/test_conversation_continue.py
 @@ -4,9 +4,7 @@
@@ -616,16 +777,71 @@ index 0e67d23..62abaaf 100644
  """
  
  from __future__ import annotations
-@@ -100,11 +98,18 @@ async def fake_send(_message: str, **_kw) -> str:
+@@ -25,6 +23,7 @@ def _make_entry() -> MagicMock:
+     entry.data = {
+         "strip_emojis": False,
+         "tts_max_chars": 0,
++        "streaming_enabled": True,  # opt-in explicitly for ChatLog tests
+         "background_enabled": False,
+     }
+     entry.options = {}
+@@ -100,11 +99,65 @@ async def fake_send(_message: str, **_kw) -> str:
      assert result.continue_conversation is False
  
  
 -# ---------- streaming, primary path (setattr on ConversationResult) ----------
-+# ---------- streaming via ChatLog deltas ----------
++async def test_chatlog_available_but_streaming_disabled_by_default() -> None:
++    """Text Assist can return the complete response with TTS limit set to 0."""
++    conv = load_conversation_module(streaming="chatlog")
++    gateway = _make_gateway()
++
++    async def fake_send(_message: str, **_kw) -> str:
++        return "Full response " * 230
++
++    gateway.send_agent_request = fake_send
++    entry = _make_entry()
++    entry.data.pop("streaming_enabled")
++    entity = conv.OpenClawConversationEntity(entry, gateway)
++    chat_log = conv.conversation.ChatLog()
++
++    result = await entity._async_handle_message(_make_user_input(), chat_log)
  
++    assert entity._attr_supports_streaming is False
++    assert chat_log.deltas == []
++    assert result.response.speech == "Full response " * 230
++    gateway.stream_agent_request.assert_not_called()
  
 -async def test_streaming_primary_path_sets_continue() -> None:
 -    conv = load_conversation_module(streaming="primary")
++
++async def test_chatlog_streaming_opt_in_without_tts_limit() -> None:
++    """Voice installations can explicitly opt in to incremental ChatLog output."""
++    conv = load_conversation_module(streaming="chatlog")
++    gateway = _make_gateway()
++
++    async def fake_stream(_message: str, **_kw) -> AsyncIterator[str]:
++        yield "Chunk one"
++        yield " and two"
++
++    gateway.stream_agent_request = fake_stream
++    entry = _make_entry()
++    entity = conv.OpenClawConversationEntity(entry, gateway)
++    chat_log = conv.conversation.ChatLog()
++
++    result = await entity._async_handle_message(_make_user_input(), chat_log)
++
++    assert entity._attr_supports_streaming is True
++    assert chat_log.deltas == [
++        {"role": "assistant"},
++        {"content": "Chunk one"},
++        {"content": " and two"},
++    ]
++    assert result.response.speech == "Chunk one and two"
++
++
++# ---------- streaming via ChatLog deltas ----------
++
++
 +async def test_supports_streaming_detects_chatlog_api() -> None:
 +    conv = load_conversation_module(streaming="chatlog")
 +    assert conv.OpenClawConversationEntity._supports_streaming_result() is True
@@ -638,7 +854,7 @@ index 0e67d23..62abaaf 100644
      gateway = _make_gateway()
  
      async def fake_stream(_message: str, **_kw) -> AsyncIterator[str]:
-@@ -114,19 +119,22 @@ async def fake_stream(_message: str, **_kw) -> AsyncIterator[str]:
+@@ -114,19 +167,22 @@ async def fake_stream(_message: str, **_kw) -> AsyncIterator[str]:
      gateway.stream_agent_request = fake_stream
  
      entity = conv.OpenClawConversationEntity(_make_entry(), gateway)
@@ -671,7 +887,7 @@ index 0e67d23..62abaaf 100644
      gateway = _make_gateway()
  
      async def fake_stream(_message: str, **_kw) -> AsyncIterator[str]:
-@@ -136,38 +144,98 @@ async def fake_stream(_message: str, **_kw) -> AsyncIterator[str]:
+@@ -136,38 +192,98 @@ async def fake_stream(_message: str, **_kw) -> AsyncIterator[str]:
      gateway.stream_agent_request = fake_stream
  
      entity = conv.OpenClawConversationEntity(_make_entry(), gateway)
