@@ -44,7 +44,7 @@ from .exceptions import (
     GatewayConnectionError,
     GatewayTimeoutError,
 )
-from .gateway_client import AgentRun, OpenClawGatewayClient
+from .gateway_client import AgentRun, AgentTextReplacement, OpenClawGatewayClient
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -395,15 +395,14 @@ class OpenClawConversationEntity(conversation.ConversationEntity):
             return streaming_result
 
         # No streaming support: drain to completion and answer plainly.
-        chunks = [first_chunk] if first_chunk else []
-        async for chunk in self._gateway_client.stream_run(agent_run):
-            chunks.append(chunk)
-        response_text = agent_run.get_response() or "".join(chunks)
+        async for _chunk in self._gateway_client.stream_run(agent_run):
+            pass
+        response_text = agent_run.get_response()
         return self._build_plain_result(user_input, chat_log, response_text)
 
     async def _resume_stream(
-        self, agent_run: AgentRun, first_chunk: str | None
-    ) -> AsyncIterator[str]:
+        self, agent_run: AgentRun, first_chunk: str | AgentTextReplacement | None
+    ) -> AsyncIterator[str | AgentTextReplacement]:
         """Re-yield the peeked first chunk, then the rest of the run."""
         if first_chunk:
             yield first_chunk
@@ -509,7 +508,7 @@ class OpenClawConversationEntity(conversation.ConversationEntity):
         user_input: conversation.ConversationInput,
         chat_log: conversation.ChatLog,
         user_message: str,
-        chunk_source: AsyncIterator[str] | None = None,
+        chunk_source: AsyncIterator[str | AgentTextReplacement] | None = None,
     ) -> conversation.ConversationResult | None:
         """Stream the reply into the chat log so HA can start TTS early.
 
@@ -546,13 +545,23 @@ class OpenClawConversationEntity(conversation.ConversationEntity):
         return result
 
     async def _stream_deltas(
-        self, chunk_source: AsyncIterator[str], should_strip: bool
+        self, chunk_source: AsyncIterator[str | AgentTextReplacement], should_strip: bool
     ) -> AsyncIterator[dict[str, str]]:
         """Translate Gateway chunks into ChatLog assistant deltas."""
         yield {"role": "assistant"}
         had_content = False
         try:
             async for chunk in chunk_source:
+                if isinstance(chunk, AgentTextReplacement):
+                    corrected = (
+                        EMOJI_PATTERN.sub("", chunk.text)
+                        if should_strip else chunk.text
+                    )
+                    had_content = had_content or bool(corrected)
+                    # The ChatLog delta API cannot retract text. Starting a
+                    # new assistant item lets intent-end return the final text.
+                    yield {"role": "assistant", "content": corrected}
+                    continue
                 if chunk and should_strip:
                     # No .strip(): whitespace between chunks must survive.
                     chunk = EMOJI_PATTERN.sub("", chunk)
