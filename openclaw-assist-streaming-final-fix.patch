@@ -201,21 +201,28 @@ diff --git a/custom_components/openclaw/gateway_client.py b/custom_components/op
          self.status = status
          self.summary = summary
          self.complete_event.set()
-@@ -122,18 +159,17 @@ def set_complete(self, status: str, summary: str | None = None) -> None:
+@@ -122,9 +159,17 @@ def set_complete(self, status: str, summary: str | None = None) -> None:
              # suppress the conversation entity's friendly error fallback.
              # stream_agent_request still raises on error status once the queue
              # drains, so the caller fails cleanly.
 -            if status == "ok" and summary and not self._streamed_any:
 -                self._stream_queue.put_nowait(summary)
 -                self._streamed_any = True
-+            if status == "ok" and summary is not None:
++            if status == "ok" and summary:
 +                self.replace_output(summary)
++            _LOGGER.debug(
++                "Run %s finished: status=%s, final_chars=%d, queued_chars=%d, "
++                "summary_present=%s",
++                self.run_id,
++                status,
++                len(self.get_response()) if status == "ok" else 0,
++                len(self._emitted_text),
++                bool(summary),
++            )
              self._stream_queue.put_nowait(None)
  
      def get_response(self) -> str:
-         """Get assembled response."""
--        if self.summary:
-+        if self.summary is not None:
+@@ -133,7 +178,7 @@ def get_response(self) -> str:
              return self.summary
          return self._full_text
  
@@ -224,7 +231,7 @@ diff --git a/custom_components/openclaw/gateway_client.py b/custom_components/op
          """Await the next streamed chunk; None is the completion sentinel.
  
          Used to peek for first content during the grace race. Raises
-@@ -145,13 +181,11 @@ async def get_chunk(self, timeout: float) -> str | None:
+@@ -145,13 +190,11 @@ async def get_chunk(self, timeout: float) -> str | None:
          if self._stream_done:
              return None
          chunk = await asyncio.wait_for(self._stream_queue.get(), timeout=timeout)
@@ -239,7 +246,7 @@ diff --git a/custom_components/openclaw/gateway_client.py b/custom_components/op
          """Yield output chunks until completion or timeout.
  
          The timeout applies per-chunk: each new chunk resets the clock.
-@@ -172,8 +206,6 @@ async def iter_stream(self, timeout: float) -> AsyncIterator[str]:
+@@ -172,8 +215,6 @@ async def iter_stream(self, timeout: float) -> AsyncIterator[str]:
              if chunk is None:
                  self._stream_done = True
                  break
@@ -248,7 +255,7 @@ diff --git a/custom_components/openclaw/gateway_client.py b/custom_components/op
              yield chunk
  
  
-@@ -482,7 +514,7 @@ async def wait_run(self, agent_run: AgentRun, timeout: float) -> str:
+@@ -482,7 +523,7 @@ async def wait_run(self, agent_run: AgentRun, timeout: float) -> str:
          finally:
              self._agent_runs.pop(agent_run.run_id, None)
  
@@ -257,7 +264,7 @@ diff --git a/custom_components/openclaw/gateway_client.py b/custom_components/op
          """Consume an already-started run: yield chunks, raise on failure.
  
          Exactly one consumer per run — this owns cleanup of the run tracker.
-@@ -512,7 +544,7 @@ async def stream_run(self, agent_run: AgentRun) -> AsyncIterator[str]:
+@@ -512,7 +553,7 @@ async def stream_run(self, agent_run: AgentRun) -> AsyncIterator[str]:
  
      async def stream_agent_request(
          self, message: str, idempotency_key: str | None = None
@@ -266,7 +273,7 @@ diff --git a/custom_components/openclaw/gateway_client.py b/custom_components/op
          """
          Send agent request and stream response chunks.
  
-@@ -556,34 +588,27 @@ def _buffer_agent_payload(agent_run: AgentRun, payload: dict[str, Any]) -> None:
+@@ -556,34 +597,27 @@ def _buffer_agent_payload(agent_run: AgentRun, payload: dict[str, Any]) -> None:
          # data.text, when supplied, is an authoritative snapshot *including*
          # the delta in the same event. Never append both.
          stream = payload.get("stream")
@@ -318,7 +325,7 @@ diff --git a/custom_components/openclaw/gateway_client.py b/custom_components/op
          if isinstance(output, str) and output:
              agent_run.add_output(output)
  
-@@ -650,8 +675,8 @@ def _handle_agent_event(self, event: dict[str, Any]) -> None:
+@@ -650,8 +684,8 @@ def _handle_agent_event(self, event: dict[str, Any]) -> None:
          phase = data.get("phase")
          run_terminal = self._is_run_lifecycle_event(stream, data)
  
