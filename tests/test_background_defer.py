@@ -74,6 +74,9 @@ class _FakeEntry:
 
 def _make_env(mod, options: dict, timeout: float = 5.0):
     """Real client with a stubbed gateway transport; events drive the run."""
+    # Tests parametrized with _conv_stream explicitly opt in; normal installs
+    # retain the reliable complete-response path by default.
+    options = {**options, "streaming_enabled": mod is _conv_stream}
     client = mod.OpenClawGatewayClient("localhost", 1, None, timeout=timeout)
     client._resolved_agent_id = "main"
 

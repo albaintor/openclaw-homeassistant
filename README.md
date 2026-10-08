@@ -72,6 +72,7 @@ through your smart-home voice assistant.
   (reminders, "task done", follow-ups) via `assist_satellite.announce` /
   `start_conversation`. [Details ›](#proactive-voice)
 - **TTS hygiene** — optional emoji stripping and length trimming for clean speech.
+- **Response delivery** — complete replies by default; opt-in ChatLog delta streaming for compatible Assist voice pipelines.
 
 **Connection & auth**
 - **Direct WebSocket** — real-time, persistent connection to the OpenClaw Gateway.
@@ -222,6 +223,7 @@ All of these are editable any time via **Settings → Devices & Services → Ope
 | **Thinking mode** | gateway default | `off` / `low` / `medium` / `high` |
 | **Strip emojis from TTS** | On | Remove emojis from spoken output |
 | **TTS max characters** | `0` (no limit) | Trim long spoken replies (0–2000) |
+| **Streaming responses** | Off | Opt in to incremental ChatLog replies when supported by your Assist client; off returns the entire response without a character cap |
 | **Background work** | On | Slow requests answer later via announce instead of timing out |
 | **Grace period** | `10` s | Silence before a request is deferred to background (3–60) |
 | **Holding phrase** | “On it — I’ll let you know when it’s done.” | Spoken when a request is deferred |
@@ -379,6 +381,19 @@ for cleaner TTS:
 - "I'm Claude 🦞" → speaks "I'm Claude" (emoji still visible in chat history).
 - Disable it if your TTS engine handles emojis well, or if you mostly use the text
   Assist box.
+
+### Response streaming
+
+**Streaming responses** is off by default: the integration waits for OpenClaw's
+completed message and returns it to Home Assistant as one response. This avoids
+partial replies in text Assist on client/pipeline combinations that do not
+correctly present incremental ChatLog events. Unlike a positive **TTS max
+characters** value, this mode does **not** truncate responses.
+
+For a compatible voice pipeline, enable **Streaming responses** under
+**Configure** and set **TTS max characters** to `0`. This enables streaming via
+`ChatLog.async_add_delta_content_stream`. If Assist only displays an initial
+word, switch streaming off rather than increasing the TTS character limit.
 
 ### TTS response trimming
 
