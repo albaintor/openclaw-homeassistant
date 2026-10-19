@@ -23,6 +23,7 @@ def _make_entry() -> MagicMock:
     entry.data = {
         "strip_emojis": False,
         "tts_max_chars": 0,
+        "streaming_enabled": True,  # opt-in explicitly for ChatLog tests
         "background_enabled": False,
     }
     entry.options = {}
@@ -96,6 +97,53 @@ async def test_non_streaming_no_followup_on_statement() -> None:
     result = await entity._async_handle_message(_make_user_input(), FakeChatLog())
 
     assert result.continue_conversation is False
+
+
+async def test_chatlog_available_but_streaming_disabled_by_default() -> None:
+    """Text Assist can return the complete response with TTS limit set to 0."""
+    conv = load_conversation_module(streaming="chatlog")
+    gateway = _make_gateway()
+
+    async def fake_send(_message: str, **_kw) -> str:
+        return "Full response " * 230
+
+    gateway.send_agent_request = fake_send
+    entry = _make_entry()
+    entry.data.pop("streaming_enabled")
+    entity = conv.OpenClawConversationEntity(entry, gateway)
+    chat_log = conv.conversation.ChatLog()
+
+    result = await entity._async_handle_message(_make_user_input(), chat_log)
+
+    assert entity.supports_streaming is False
+    assert chat_log.deltas == []
+    assert result.response.speech == "Full response " * 230
+    gateway.stream_agent_request.assert_not_called()
+
+
+async def test_chatlog_streaming_opt_in_without_tts_limit() -> None:
+    """Voice installations can explicitly opt in to incremental ChatLog output."""
+    conv = load_conversation_module(streaming="chatlog")
+    gateway = _make_gateway()
+
+    async def fake_stream(_message: str, **_kw) -> AsyncIterator[str]:
+        yield "Chunk one"
+        yield " and two"
+
+    gateway.stream_agent_request = fake_stream
+    entry = _make_entry()
+    entity = conv.OpenClawConversationEntity(entry, gateway)
+    chat_log = conv.conversation.ChatLog()
+
+    result = await entity._async_handle_message(_make_user_input(), chat_log)
+
+    assert entity.supports_streaming is True
+    assert chat_log.deltas == [
+        {"role": "assistant"},
+        {"content": "Chunk one"},
+        {"content": " and two"},
+    ]
+    assert result.response.speech == "Chunk one and two"
 
 
 # ---------- streaming via ChatLog deltas ----------

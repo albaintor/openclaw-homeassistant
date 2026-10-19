@@ -26,6 +26,7 @@ from .const import (
     CONF_PROACTIVE_SATELLITE,
     CONF_STRIP_EMOJIS,
     CONF_TTS_MAX_CHARS,
+    CONF_STREAMING_ENABLED,
     DEFAULT_BACKGROUND_ENABLED,
     DEFAULT_BACKGROUND_GRACE,
     DEFAULT_HOLDING_PHRASE,
@@ -33,6 +34,7 @@ from .const import (
     DEFAULT_PROACTIVE_MODE,
     DEFAULT_STRIP_EMOJIS,
     DEFAULT_TTS_MAX_CHARS,
+    DEFAULT_STREAMING_ENABLED,
     DOMAIN,
     PROACTIVE_MODE_START_CONVERSATION,
 )
@@ -123,7 +125,12 @@ class OpenClawConversationEntity(conversation.ConversationEntity):
         self._config_entry = config_entry
         self._gateway_client = gateway_client
         self._attr_unique_id = config_entry.entry_id
-        self._attr_supports_streaming = self._supports_streaming_result()
+        options = {**config_entry.data, **config_entry.options}
+        self._attr_supports_streaming = (
+            options.get(CONF_STREAMING_ENABLED, DEFAULT_STREAMING_ENABLED)
+            and options.get(CONF_TTS_MAX_CHARS, DEFAULT_TTS_MAX_CHARS) == 0
+            and self._supports_streaming_result()
+        )
         # Runs detached past the grace period, reporting back via announce.
         self._background_tasks: set[asyncio.Task] = set()
 
@@ -239,6 +246,9 @@ class OpenClawConversationEntity(conversation.ConversationEntity):
             "thinking": self._gateway_client.thinking,
             "strip_emojis": data.get(CONF_STRIP_EMOJIS, DEFAULT_STRIP_EMOJIS),
             "tts_max_chars": data.get(CONF_TTS_MAX_CHARS, DEFAULT_TTS_MAX_CHARS),
+            "streaming_enabled": data.get(
+                CONF_STREAMING_ENABLED, DEFAULT_STREAMING_ENABLED
+            ),
             "proactive_enabled": data.get(
                 CONF_PROACTIVE_ENABLED, DEFAULT_PROACTIVE_ENABLED
             ),
@@ -506,9 +516,13 @@ class OpenClawConversationEntity(conversation.ConversationEntity):
         Returns None when streaming is unavailable (or TTS trimming is on,
         which needs the full text), so callers fall back to a plain result.
         """
+        config = {**self._config_entry.data, **self._config_entry.options}
+        # Assist text sessions must be able to wait for the final answer; the
+        # optional ChatLog streaming path is not reliable on every HA client.
+        if not config.get(CONF_STREAMING_ENABLED, DEFAULT_STREAMING_ENABLED):
+            return None
         if not self._supports_streaming_result():
             return None
-        config = {**self._config_entry.data, **self._config_entry.options}
         if config.get(CONF_TTS_MAX_CHARS, DEFAULT_TTS_MAX_CHARS) > 0:
             return None
 
