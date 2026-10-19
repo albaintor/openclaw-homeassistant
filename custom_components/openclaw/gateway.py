@@ -454,6 +454,15 @@ class GatewayProtocol:
                     raise GatewayAuthenticationError(
                         f"Authentication failed: {error_msg}"
                     )
+                # Startup can reject a valid handshake while sidecars warm up.
+                # Keep the connection loop alive only for explicitly retryable
+                # availability errors; auth and protocol failures stay fatal.
+                if (
+                    error_code == "UNAVAILABLE"
+                    and isinstance(error_msg, dict)
+                    and error_msg.get("retryable") is True
+                ):
+                    raise GatewayConnectionError(f"Connection failed: {error_msg}")
                 raise ProtocolError(f"Connection failed: {error_msg}")
 
             self._connect_snapshot = response.get("payload", {})

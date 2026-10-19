@@ -146,6 +146,11 @@ data:
 > Pre-release builds: enable **Show beta versions** in the integration's HACS page
 > to install beta tags (e.g. `1.7.0-beta.1`).
 
+For an existing installation, download the new version from the integration's
+HACS page, then restart Home Assistant to load the updated code. If an update is
+missing, refresh the repository information in HACS. Versions come from published
+GitHub Releases, not tags alone; see [Releasing for HACS](RELEASING.md).
+
 ### Manual
 
 1. Copy `custom_components/openclaw` into your Home Assistant `custom_components`

@@ -5,9 +5,10 @@ import importlib.util
 import json
 import logging
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import ModuleType
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -137,6 +138,37 @@ class TestMessageHandling:
 
 
 class TestHandshake:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("error", "expected"),
+        [
+            (
+                {"code": "UNAVAILABLE", "message": "gateway starting", "retryable": True},
+                GatewayConnectionError,
+            ),
+            ({"code": "UNAVAILABLE", "retryable": False}, ProtocolError),
+            ({"code": "UNAVAILABLE"}, ProtocolError),
+            ({"code": "UNAVAILABLE", "retryable": "true"}, ProtocolError),
+            ({"code": "INVALID_REQUEST", "retryable": True}, ProtocolError),
+            (
+                {"code": "UNAVAILABLE", "message": "invalid token", "retryable": True},
+                GatewayAuthenticationError,
+            ),
+            ({"code": "NOT_PAIRED", "retryable": True}, DevicePairingRequiredError),
+        ],
+    )
+    async def test_retryable_handshake_error_classification(self, error, expected) -> None:
+        def response(sent):
+            return {"type": "res", "id": sent[-1]["id"], "ok": False, "error": error}
+
+        protocol = GatewayProtocol("localhost", 1, "token")
+        protocol._websocket = DummyWebSocket(
+            [{"type": "event", "event": "connect.challenge", "payload": {}}, response]
+        )
+
+        with pytest.raises(expected):
+            await protocol._handshake()
+
     @pytest.mark.asyncio
     async def test_auth_error_raises(self) -> None:
         def response(sent):
@@ -287,6 +319,60 @@ class TestHandshake:
         await protocol._handshake()
 
         assert protocol.presence == {"clients": ["client-a", "client-b"]}
+
+
+class TestConnectionLoop:
+    @pytest.mark.asyncio
+    async def test_retries_starting_gateway_then_connects(self, monkeypatch) -> None:
+        """A temporary startup rejection must not disable automatic reconnect."""
+        challenge = {"type": "event", "event": "connect.challenge", "payload": {}}
+
+        def starting(sent):
+            return {
+                "type": "res",
+                "id": sent[-1]["id"],
+                "ok": False,
+                "error": {
+                    "code": "UNAVAILABLE",
+                    "message": "gateway starting; retry shortly",
+                    "retryable": True,
+                    "retryAfterMs": 500,
+                    "details": {"reason": "startup-sidecars"},
+                },
+            }
+
+        def ready(sent):
+            return {"type": "res", "id": sent[-1]["id"], "ok": True, "payload": {}}
+
+        sockets = iter(
+            [DummyWebSocket([challenge, starting]), DummyWebSocket([challenge, ready])]
+        )
+        attempts = []
+
+        @asynccontextmanager
+        async def connect(*args, **kwargs):
+            socket = next(sockets)
+            attempts.append(socket)
+            yield socket
+
+        sleep = AsyncMock()
+        monkeypatch.setattr(_gateway, "connect", connect)
+        monkeypatch.setattr(_gateway.asyncio, "sleep", sleep)
+        protocol = GatewayProtocol("localhost", 1, "token")
+        protocol._receive_loop = AsyncMock(side_effect=asyncio.CancelledError)
+        protocol._heartbeat_loop = AsyncMock()
+        connected = Mock()
+        fatal = Mock()
+        protocol._on_connected = connected
+        protocol._on_fatal_error = fatal
+
+        await protocol._connection_loop()
+
+        assert len(attempts) == 2
+        sleep.assert_awaited_once_with(5)
+        connected.assert_called_once_with()
+        fatal.assert_not_called()
+        assert protocol._fatal_error is None
 
 
 class TestChallengeHandshake:
