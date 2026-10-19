@@ -215,6 +215,47 @@ class TestModernAssistantEvents:
         assert chunks[1].text == "Corrected"
 
 class TestHandleAgentEvent:
+    def test_result_payloads_reconcile_stream_and_include_all_messages(self) -> None:
+        client = OpenClawGatewayClient("localhost", 1, None)
+        run = AgentRun("run-1", stream=True)
+        client._agent_runs["run-1"] = run
+
+        client._handle_agent_event({
+            "payload": {"runId": "run-1", "stream": "assistant",
+                        "data": {"delta": "Home"}}
+        })
+        client._handle_agent_event({
+            "payload": {"runId": "run-1", "result": {
+                "payloads": [{"text": "Home Assistant"}, {"text": "Deuxième réponse."}]
+            }}
+        })
+        assert run.get_response() == "Home Assistant\n\nDeuxième réponse."
+
+    def test_item_scoped_snapshots_preserve_previous_items(self) -> None:
+        client = OpenClawGatewayClient("localhost", 1, None)
+        run = AgentRun("run-1")
+        client._agent_runs["run-1"] = run
+        for data in (
+            {"itemId": "first", "text": "Hello", "delta": "Hello"},
+            {"itemId": "first", "delta": " world"},
+            {"itemId": "second", "text": "Second"},
+            {"itemId": "second", "delta": " item"},
+        ):
+            client._handle_agent_event({
+                "payload": {"runId": "run-1", "stream": "assistant", "data": data}
+            })
+        assert run.get_response() == "Hello world\n\nSecond item"
+
+    def test_per_item_status_does_not_complete_run(self) -> None:
+        client = OpenClawGatewayClient("localhost", 1, None)
+        run = AgentRun("run-1")
+        client._agent_runs["run-1"] = run
+        client._handle_agent_event({
+            "payload": {"runId": "run-1", "stream": "assistant",
+                        "status": "ok", "data": {"itemId": "one"}}
+        })
+        assert not run.complete_event.is_set()
+
     def test_buffers_output_from_data_text(self) -> None:
         client = OpenClawGatewayClient("localhost", 1, None)
         run = AgentRun("run-1")
