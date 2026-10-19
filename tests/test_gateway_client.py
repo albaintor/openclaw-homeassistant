@@ -81,6 +81,101 @@ class TestAgentRun:
         assert chunks == []
 
 
+class TestModernAssistantEvents:
+    def test_delta_after_initial_snapshot_builds_complete_response(self) -> None:
+        client = OpenClawGatewayClient("localhost", 1, None)
+        run = AgentRun("run-1")
+        client._agent_runs["run-1"] = run
+
+        client._handle_agent_event({
+            "payload": {"runId": "run-1", "stream": "assistant",
+                        "data": {"text": "Home", "delta": "Home"}}
+        })
+        client._handle_agent_event({
+            "payload": {"runId": "run-1", "stream": "assistant",
+                        "data": {"delta": " Assistant"}}
+        })
+        client._handle_agent_event({
+            "payload": {"runId": "run-1", "stream": "assistant",
+                        "data": {"delta": " automatise la maison."}}
+        })
+        assert run.get_response() == "Home Assistant automatise la maison."
+
+    def test_authoritative_snapshot_already_includes_delta(self) -> None:
+        client = OpenClawGatewayClient("localhost", 1, None)
+        run = AgentRun("run-1")
+        client._agent_runs["run-1"] = run
+        for data in (
+            {"text": "Hello", "delta": "Hello"},
+            {"text": "Hello world", "delta": " world"},
+            {"delta": "!"},
+            {"text": "Hello world!", "delta": "!"},
+        ):
+            client._handle_agent_event({
+                "payload": {"runId": "run-1", "stream": "assistant", "data": data}
+            })
+        assert run.get_response() == "Hello world!"
+
+    def test_replace_and_empty_retract_on_non_streaming_run(self) -> None:
+        client = OpenClawGatewayClient("localhost", 1, None)
+        run = AgentRun("run-1")
+        client._agent_runs["run-1"] = run
+        def deliver(data):
+            client._handle_agent_event({
+                "payload": {"runId": "run-1", "stream": "assistant", "data": data}
+            })
+        deliver({"delta": "Draft"})
+        deliver({"replace": True, "delta": "Corrected"})
+        assert run.get_response() == "Corrected"
+        deliver({"replace": True, "delta": ""})
+        assert run.get_response() == ""
+        deliver({"text": "Final"})
+        assert run.get_response() == "Final"
+        deliver({"replace": True, "text": ""})
+        assert run.get_response() == ""
+
+    def test_ignores_delta_from_tool_stream(self) -> None:
+        client = OpenClawGatewayClient("localhost", 1, None)
+        run = AgentRun("run-1")
+        client._agent_runs["run-1"] = run
+        client._handle_agent_event({
+            "payload": {"runId": "run-1", "stream": "tool",
+                        "data": {"delta": "secret tool output"}}
+        })
+        assert run.get_response() == ""
+
+    @pytest.mark.asyncio
+    async def test_streaming_yields_every_delta_once(self) -> None:
+        client = OpenClawGatewayClient("localhost", 1, None)
+        run = AgentRun("run-1", stream=True)
+        client._agent_runs["run-1"] = run
+        for data in (
+            {"text": "Home", "delta": "Home"},
+            {"delta": " Assistant"},
+            {"text": "Home Assistant est libre", "delta": " est libre"},
+            {"delta": "."},
+        ):
+            client._handle_agent_event({
+                "payload": {"runId": "run-1", "stream": "assistant", "data": data}
+            })
+        client._handle_agent_event({
+            "payload": {"runId": "run-1", "stream": "lifecycle",
+                        "data": {"phase": "end"}}
+        })
+        chunks = [chunk async for chunk in client.stream_run(run)]
+        assert chunks == ["Home", " Assistant", " est libre", "."]
+        assert "".join(chunks) == "Home Assistant est libre."
+        assert client._agent_runs == {}
+
+    @pytest.mark.asyncio
+    async def test_streamed_replacement_fails_instead_of_duplicating(self) -> None:
+        run = AgentRun("run-1", stream=True)
+        run.add_delta("Draft")
+        run.replace_output("Corrected")
+        run.set_complete("ok")
+        with pytest.raises(AgentExecutionError, match="replaced"):
+            _ = [chunk async for chunk in run.iter_stream(timeout=1)]
+
 class TestHandleAgentEvent:
     def test_buffers_output_from_data_text(self) -> None:
         client = OpenClawGatewayClient("localhost", 1, None)
