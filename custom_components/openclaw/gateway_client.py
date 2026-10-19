@@ -1,6 +1,7 @@
 """High-level OpenClaw Gateway API client."""
 
 import asyncio
+from dataclasses import dataclass
 import logging
 import time
 import uuid
@@ -19,6 +20,13 @@ from .gateway import GatewayProtocol
 _LOGGER = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class AgentTextReplacement:
+    """The authoritative text replaces previously streamed content."""
+
+    text: str
+
+
 class AgentRun:
     """Tracks an agent run and buffers its events."""
 
@@ -30,7 +38,8 @@ class AgentRun:
         self.complete_event = asyncio.Event()
         # Assistant text may arrive as cumulative snapshots or append deltas.
         self._full_text: str = ""
-        self._stream_queue: asyncio.Queue[str | AgentExecutionError | None] | None = (
+        self._emitted_text: str = ""
+        self._stream_queue: asyncio.Queue[str | AgentTextReplacement | None] | None = (
             asyncio.Queue() if stream else None
         )
         self._streamed_any = False
@@ -69,18 +78,15 @@ class AgentRun:
             self.replace_output(output)
             return
 
-        if new_text and self._stream_queue is not None:
-            self._stream_queue.put_nowait(new_text)
-            self._streamed_any = True
+        if new_text:
+            self._publish_text()
 
     def add_delta(self, delta: str) -> None:
         """Append a Gateway assistant data.delta update."""
         if not delta:
             return
         self._full_text += delta
-        if self._stream_queue is not None:
-            self._stream_queue.put_nowait(delta)
-            self._streamed_any = True
+        self._publish_text()
 
     def replace_output(self, output: str) -> None:
         """Apply an authoritative replacement, including an empty retraction.
@@ -91,24 +97,18 @@ class AgentRun:
         """
         previous = self._full_text
         self._full_text = output
-        if self._stream_queue is None:
+        self._publish_text()
+
+    def _publish_text(self) -> None:
+        """Queue new text, or a corrected message if the prefix changed."""
+        if self._stream_queue is None or self._emitted_text == self._full_text:
             return
-        if output.startswith(previous):
-            extra = output[len(previous):]
-            if extra:
-                self._stream_queue.put_nowait(extra)
-                self._streamed_any = True
-        elif previous:
-            _LOGGER.warning(
-                "Agent %s replaced already buffered text; streaming cannot retract it",
-                self.run_id,
-            )
-            self._stream_queue.put_nowait(
-                AgentExecutionError("Gateway replaced previously streamed assistant text")
-            )
-        elif output:
-            self._stream_queue.put_nowait(output)
-            self._streamed_any = True
+        if self._full_text.startswith(self._emitted_text):
+            self._stream_queue.put_nowait(self._full_text[len(self._emitted_text):])
+        else:
+            self._stream_queue.put_nowait(AgentTextReplacement(self._full_text))
+        self._emitted_text = self._full_text
+        self._streamed_any = True
 
     def set_complete(self, status: str, summary: str | None = None) -> None:
         """Mark run as complete."""
@@ -122,9 +122,9 @@ class AgentRun:
             # suppress the conversation entity's friendly error fallback.
             # stream_agent_request still raises on error status once the queue
             # drains, so the caller fails cleanly.
-            if status == "ok" and summary and not self._streamed_any:
-                self._stream_queue.put_nowait(summary)
-                self._streamed_any = True
+            if status == "ok" and summary is not None:
+                self._full_text = summary
+                self._publish_text()
             self._stream_queue.put_nowait(None)
 
     def get_response(self) -> str:
@@ -133,7 +133,7 @@ class AgentRun:
             return self.summary
         return self._full_text
 
-    async def get_chunk(self, timeout: float) -> str | None:
+    async def get_chunk(self, timeout: float) -> str | AgentTextReplacement | None:
         """Await the next streamed chunk; None is the completion sentinel.
 
         Used to peek for first content during the grace race. Raises
@@ -145,13 +145,11 @@ class AgentRun:
         if self._stream_done:
             return None
         chunk = await asyncio.wait_for(self._stream_queue.get(), timeout=timeout)
-        if isinstance(chunk, AgentExecutionError):
-            raise chunk
         if chunk is None:
             self._stream_done = True
         return chunk
 
-    async def iter_stream(self, timeout: float) -> AsyncIterator[str]:
+    async def iter_stream(self, timeout: float) -> AsyncIterator[str | AgentTextReplacement]:
         """Yield output chunks until completion or timeout.
 
         The timeout applies per-chunk: each new chunk resets the clock.
@@ -172,8 +170,6 @@ class AgentRun:
             if chunk is None:
                 self._stream_done = True
                 break
-            if isinstance(chunk, AgentExecutionError):
-                raise chunk
             yield chunk
 
 
@@ -482,7 +478,7 @@ class OpenClawGatewayClient:
         finally:
             self._agent_runs.pop(agent_run.run_id, None)
 
-    async def stream_run(self, agent_run: AgentRun) -> AsyncIterator[str]:
+    async def stream_run(self, agent_run: AgentRun) -> AsyncIterator[str | AgentTextReplacement]:
         """Consume an already-started run: yield chunks, raise on failure.
 
         Exactly one consumer per run — this owns cleanup of the run tracker.
@@ -512,7 +508,7 @@ class OpenClawGatewayClient:
 
     async def stream_agent_request(
         self, message: str, idempotency_key: str | None = None
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[str | AgentTextReplacement]:
         """
         Send agent request and stream response chunks.
 
