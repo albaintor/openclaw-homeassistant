@@ -159,13 +159,13 @@ class AgentRun:
             # suppress the conversation entity's friendly error fallback.
             # stream_agent_request still raises on error status once the queue
             # drains, so the caller fails cleanly.
-            if status == "ok" and summary is not None:
+            if status == "ok" and summary:
                 self.replace_output(summary)
             self._stream_queue.put_nowait(None)
 
     def get_response(self) -> str:
         """Get assembled response."""
-        if self.summary is not None:
+        if self.summary:
             return self.summary
         return self._full_text
 
