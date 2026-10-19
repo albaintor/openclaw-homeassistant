@@ -115,7 +115,7 @@ async def test_chatlog_available_but_streaming_disabled_by_default() -> None:
 
     result = await entity._async_handle_message(_make_user_input(), chat_log)
 
-    assert entity.supports_streaming is False
+    assert entity._attr_supports_streaming is False
     assert chat_log.deltas == []
     assert result.response.speech == "Full response " * 230
     gateway.stream_agent_request.assert_not_called()
@@ -137,7 +137,7 @@ async def test_chatlog_streaming_opt_in_without_tts_limit() -> None:
 
     result = await entity._async_handle_message(_make_user_input(), chat_log)
 
-    assert entity.supports_streaming is True
+    assert entity._attr_supports_streaming is True
     assert chat_log.deltas == [
         {"role": "assistant"},
         {"content": "Chunk one"},
