@@ -71,6 +71,42 @@ class TestAgentRun:
         assert chunks == ["Final answer"]
 
     @pytest.mark.asyncio
+    async def test_final_summary_appends_missing_suffix(self) -> None:
+        run = AgentRun("run-1", stream=True)
+        run.add_delta("Home")
+        run.set_complete("ok", "Home Assistant automatise la maison.")
+        chunks = [chunk async for chunk in run.iter_stream(timeout=1.0)]
+        assert chunks == ["Home", " Assistant automatise la maison."]
+        assert "".join(chunks) == run.get_response()
+
+    @pytest.mark.asyncio
+    async def test_final_summary_replaces_nonprefix_content(self) -> None:
+        run = AgentRun("run-1", stream=True)
+        run.add_delta("Home")
+        run.set_complete("ok", "La domotique contrôle la maison.")
+        chunks = [chunk async for chunk in run.iter_stream(timeout=1.0)]
+        assert chunks[0] == "Home"
+        assert isinstance(chunks[1], _gateway_client.AgentTextReplacement)
+        assert chunks[1].text == run.get_response()
+
+    @pytest.mark.asyncio
+    async def test_final_summary_equal_to_stream_not_duplicated(self) -> None:
+        run = AgentRun("run-1", stream=True)
+        run.add_delta("Home Assistant")
+        run.set_complete("ok", "Home Assistant")
+        assert [chunk async for chunk in run.iter_stream(timeout=1.0)] == ["Home Assistant"]
+
+    @pytest.mark.asyncio
+    async def test_no_final_summary_keeps_streamed_answer(self) -> None:
+        run = AgentRun("run-1", stream=True)
+        run.add_delta("Home")
+        run.add_delta(" Assistant")
+        run.set_complete("ok", None)
+        assert [chunk async for chunk in run.iter_stream(timeout=1.0)] == [
+            "Home", " Assistant"
+        ]
+
+    @pytest.mark.asyncio
     async def test_error_summary_not_streamed_as_content(self) -> None:
         # On error the summary is an internal diagnostic; it must not be
         # streamed as spoken content (which would also suppress the friendly
@@ -168,13 +204,15 @@ class TestModernAssistantEvents:
         assert client._agent_runs == {}
 
     @pytest.mark.asyncio
-    async def test_streamed_replacement_fails_instead_of_duplicating(self) -> None:
+    async def test_streamed_replacement_emits_corrected_message(self) -> None:
         run = AgentRun("run-1", stream=True)
         run.add_delta("Draft")
         run.replace_output("Corrected")
         run.set_complete("ok")
-        with pytest.raises(AgentExecutionError, match="replaced"):
-            _ = [chunk async for chunk in run.iter_stream(timeout=1)]
+        chunks = [chunk async for chunk in run.iter_stream(timeout=1)]
+        assert chunks[0] == "Draft"
+        assert isinstance(chunks[1], _gateway_client.AgentTextReplacement)
+        assert chunks[1].text == "Corrected"
 
 class TestHandleAgentEvent:
     def test_buffers_output_from_data_text(self) -> None:
