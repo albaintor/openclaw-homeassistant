@@ -161,6 +161,15 @@ class AgentRun:
             # drains, so the caller fails cleanly.
             if status == "ok" and summary:
                 self.replace_output(summary)
+            _LOGGER.debug(
+                "Run %s finished: status=%s, final_chars=%d, queued_chars=%d, "
+                "summary_present=%s",
+                self.run_id,
+                status,
+                len(self.get_response()) if status == "ok" else 0,
+                len(self._emitted_text),
+                bool(summary),
+            )
             self._stream_queue.put_nowait(None)
 
     def get_response(self) -> str:
