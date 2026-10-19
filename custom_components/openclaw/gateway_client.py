@@ -588,34 +588,27 @@ class OpenClawGatewayClient:
         # data.text, when supplied, is an authoritative snapshot *including*
         # the delta in the same event. Never append both.
         stream = payload.get("stream")
-        if stream in (None, "assistant"):
-            snapshot = data.get("text")
-            if isinstance(snapshot, str):
-                if data.get("replace") and not snapshot:
-                    agent_run.replace_output("")
-                else:
-                    agent_run.add_output(snapshot)
+        if stream in (None, "assistant") and (
+            isinstance(data.get("text"), str)
+            or isinstance(data.get("delta"), str)
+        ):
+            agent_run.add_assistant_event(data)
+            return
+
+        # Final action results can supersede provisional assistant items.
+        result = payload.get("result")
+        if isinstance(result, dict) and isinstance(result.get("payloads"), list):
+            texts = [
+                item["text"]
+                for item in result["payloads"]
+                if isinstance(item, dict) and isinstance(item.get("text"), str)
+            ]
+            if texts:
+                agent_run.replace_output("\n\n".join(text for text in texts if text))
                 return
 
-            delta = data.get("delta")
-            if isinstance(delta, str):
-                if data.get("replace"):
-                    agent_run.replace_output(delta)
-                else:
-                    agent_run.add_delta(delta)
-                return
-
-        # Legacy gateways and action runs return a cumulative output or a
-        # result.payloads text rather than v4 assistant deltas.
+        # Legacy gateways send cumulative top-level output.
         output = payload.get("output")
-        if not output:
-            result = payload.get("result")
-            if isinstance(result, dict):
-                for item in result.get("payloads", []):
-                    if isinstance(item, dict) and item.get("text"):
-                        output = item["text"]
-                        break
-
         if isinstance(output, str) and output:
             agent_run.add_output(output)
 
@@ -682,8 +675,8 @@ class OpenClawGatewayClient:
         phase = data.get("phase")
         run_terminal = self._is_run_lifecycle_event(stream, data)
 
-        if status in ("ok", "error"):
-            # Legacy completion signalled by a top-level status field.
+        if status in ("ok", "error") and run_terminal:
+            # A per-item status must not complete the entire run.
             summary = payload.get("summary")
             agent_run.set_complete(status, summary)
             _LOGGER.info("Agent run %s completed with status: %s", run_id, status)
